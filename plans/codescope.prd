@@ -1,0 +1,214 @@
+# PRD: `codescope` — A Rust Code-Intelligence Engine for AI Agents
+
+**Status:** Draft v1.0
+**Author:** (you)
+**Last updated:** May 28, 2026
+**One-liner:** A single-binary, blazing-fast code-intelligence engine that turns any repository into a queryable structural graph — purpose-built to be *consumed by AI coding agents*, not stared at by humans.
+
+---
+
+## 1. Why this, why now
+
+Every AI coding agent (Claude Code, Cursor, Codex CLI, Gemini CLI, Cline, Continue) has the same fundamental weakness: it greps its way through a codebase one file at a time, rebuilding its understanding from scratch on every task, and blows out its context window or hallucinates when the repo gets large. Sourcegraph's own comparison puts it plainly — coding agents have **no persistence**; context is "rebuilt from scratch on each task."
+
+There is real, repeatedly-expressed demand for fixing this:
+
+- **The gap is unfilled.** The dedicated code-graph space has been "underserved since Sourcetrail was discontinued in December 2021" — and *"Sourcetrail alternative"* remains one of the most-searched terms in the category more than four years later. CodeSee was acquired in 2024 with unclear direction. dependency-cruiser and Madge exist but are JS/TS-only and built for *human visualization*, not agent consumption.
+- **The current crop is the wrong shape.** Most existing MCP code-indexers (CodeIndexer, codebase-indexer-mcp, CodeGraphContext) are written in Python, lean heavily on vector embeddings + a separate vector DB (ChromaDB, Milvus), and are slow to install and slow to index. They return *approximate* results based on similarity rather than *structurally precise* ones.
+- **Rust is the proven winner for this exact niche.** The dev tools that displaced their predecessors — ripgrep (powers VS Code search), fd, bat, Alacritty, Zed, Biome — are all Rust, chosen because Rust's profile (fast startup, low memory, deterministic latency) is *exactly* what dev tooling needs. A code-intelligence engine has the same requirements, raised to a higher power.
+- **It validates a pattern that real builders already discovered independently.** The recurring insight from practitioners is that the unlock isn't a smarter model — it's making the *codebase* smarter so the agent doesn't have to wander and burn tokens. That's precisely this product.
+
+The window is open but closing: `codegraph` (a Rust + tree-sitter MCP project) appeared in May 2026, and Cursor added in-IDE dependency-graph awareness in March 2026. There is room for a best-in-class, standalone, agent-first, multi-language tool — but not indefinitely.
+
+---
+
+## 2. Target users
+
+| Persona | Need | What they do today |
+|---|---|---|
+| **AI agent power users** | Stop the agent from grepping/hallucinating in big repos; cut token spend | Hand-write `CLAUDE.md`, paste files, pray |
+| **Platform/DevEx engineers** | Give *every* agent in the org the same structural map of a monorepo | Maintain Mermaid diagrams by hand; nothing persistent |
+| **Tool builders** | A precise, queryable backend for their own agent/IDE/plugin | Glue together tree-sitter + a vector DB themselves |
+| **Solo devs onboarding to a legacy repo** | "What calls this? What breaks if I change it?" | Read files for hours; the original Sourcetrail use case |
+
+Primary wedge: **AI agent power users**, reached via the MCP ecosystem (a built-in distribution channel — one MCP server works across Claude Code, Cursor, Windsurf, VS Code/Copilot, Cline, Zed, Continue).
+
+---
+
+## 3. Goals & non-goals
+
+### Goals
+- Be the **fastest** way to give an agent precise, structural answers about a codebase.
+- **Single static binary.** `cargo install codescope` or a curl-able release; no Python, no Docker, no external DB.
+- **Structurally precise by default** (AST + symbol resolution), with optional semantic search as an *additive* layer, not the foundation.
+- **Token-efficient output.** Answers are designed to fit an agent's context budget — return symbols, signatures, call edges, and line ranges, never whole files unless asked.
+- **Incremental.** Re-index only what changed on each commit/save (tree-sitter re-parses modified code in O(log n); 2026 benchmarks show incremental parsing cuts parse time up to ~70% on large codebases).
+- **MCP-native** so it plugs into every major agent with zero custom integration.
+
+### Non-goals (v1)
+- Not a human-facing GUI/visualizer (that's a possible later add-on; v1 is API/CLI/MCP).
+- Not a hosted multi-tenant cloud service (local-first; SaaS is a later monetization path).
+- Not a replacement for a full language server / type checker. We aim for "compiler-adjacent precision where cheap, fast heuristics where not," not full type inference.
+- Not trying to do code *generation* — we make the surrounding context smart; the model writes the code.
+
+---
+
+## 4. Core capabilities (v1 scope)
+
+The product answers the questions an agent actually needs, fast, with small payloads:
+
+1. **Symbol map** — every function, struct/class, trait/interface, type, and module, with signature + file:line range.
+2. **Call graph** — `who calls X` (callers) and `what does X call` (callees), transitively to a requested depth.
+3. **Blast radius** — given a symbol or file, what is downstream-affected if it changes (the single most-requested agent query: "what will this edit break?").
+4. **Definition & references** — go-to-def and find-all-references, structural (not text-match).
+5. **Dependency / import graph** — module- and file-level edges, cycle detection.
+6. **Structural search** — query by code structure ("all functions that call `db.query` and return `Result`"), not just strings.
+7. **Repo summary** — an auto-generated, token-bounded architectural overview the agent reads first (the "read this before you touch anything" file, generated rather than hand-written).
+
+Each capability is exposed three ways: **CLI** (human + scripts), **JSON over stdout** (programmatic), and **MCP tools** (agents).
+
+---
+
+## 5. Architecture
+
+```
+                 ┌────────────────────────────────────────────┐
+                 │                 codescope                    │
+                 │                                              │
+  repo on disk → │  ┌──────────┐   ┌───────────┐   ┌─────────┐ │
+                 │  │ Walker   │ → │ tree-sitter│ → │ Symbol  │ │
+                 │  │ (ignore- │   │ parsers    │   │ resolver│ │
+                 │  │  aware)  │   │ (per-lang) │   │ + edges │ │
+                 │  └──────────┘   └───────────┘   └────┬────┘ │
+                 │                                       │      │
+                 │           ┌───────────────────────────▼────┐ │
+                 │           │  Embedded store (graph index)   │ │
+                 │           │  redb / SQLite, mmap'd, on-disk │ │
+                 │           └───────┬─────────────────┬───────┘ │
+                 │                   │                 │         │
+                 │            ┌──────▼─────┐    ┌──────▼──────┐  │
+                 │            │ Query API  │    │ Incremental │  │
+                 │            └──┬───┬───┬─┘    │ watcher     │  │
+                 │               │   │   │      └─────────────┘  │
+                 └───────────────┼───┼───┼─────────────────────┘
+                                 │   │   │
+                              CLI  JSON  MCP server (stdio)
+```
+
+**Key technical choices**
+
+- **Parsing:** `tree-sitter` (itself written in Rust; 40+ languages; robust error recovery so it parses broken/in-progress code; incremental). Start with grammars that have the strongest ecosystems: **Rust, TypeScript/JavaScript, Python, Go**. These four cover the overwhelming majority of agent users and have mature `.tsg`/tree-sitter-graph support.
+- **Symbol resolution:** Hybrid. Use **SCIP** (SCIP Code Intelligence Protocol) output when a precise indexer is available (e.g. ingest `rust-analyzer`'s `scip` command output, `scip-typescript`, `scip-python`) for compiler-accurate cross-file/cross-repo navigation; fall back to fast tree-sitter-based resolution for "search-based precision" everywhere else. This mirrors Sourcegraph's proven two-tier model (search-based = fast/always-on, precise = compiler-accurate) — but bundled into one tool.
+- **Storage:** embedded, single-file, memory-mapped (`redb` or `rusqlite`). No external graph DB. This is the differentiator vs. the Python/Neo4j/vector-DB incumbents.
+- **Optional semantic layer:** local embeddings (e.g. a small ONNX model via `ort`) stored alongside the graph, queried only when the structural query is insufficient. Strictly additive and off by default.
+- **Concurrency:** `rayon` for parallel parsing across files; `tokio` only for the MCP/HTTP server surface.
+- **Incremental sync:** file watcher (`notify`) + content hashing; on change, re-parse only affected files and patch the graph. Index can be keyed to commit hashes for "navigate any commit" later.
+
+---
+
+## 6. Interfaces
+
+### CLI (illustrative)
+```
+codescope index .                      # build/refresh the index
+codescope callers my_module::do_thing  # who calls it
+codescope callees do_thing --depth 2   # what it calls, transitively
+codescope blast-radius src/auth.rs     # what changes if I touch this
+codescope refs UserSession             # all references
+codescope summary --max-tokens 4000    # architectural overview for an agent
+codescope search "fn returning Result that calls db.query"
+codescope serve --mcp                  # start the MCP server over stdio
+```
+
+### MCP tools (what agents see)
+- `cs_index`, `cs_callers`, `cs_callees`, `cs_blast_radius`, `cs_definition`, `cs_references`, `cs_dependency_graph`, `cs_structural_search`, `cs_repo_summary`.
+- Every tool returns compact JSON with `symbol`, `kind`, `file`, `line_start/line_end`, and edge lists — explicitly **token-budgeted** (caller passes a max-tokens hint; tool truncates with a `truncated: true` flag rather than dumping).
+
+### Output contract (design principle)
+> The agent should be able to plan an entire refactor from `codescope` answers **without reading a single file**, then open only the exact line ranges it needs. That's the bar.
+
+---
+
+## 7. Differentiation
+
+| | Existing Python/embeddings MCP indexers | Sourcegraph | IDE-embedded (Cursor) | **codescope** |
+|---|---|---|---|---|
+| Single binary, no external DB | ✗ | ✗ (server) | ✗ | ✓ |
+| Install speed | slow (pip + DB) | heavy | n/a | `cargo install` / curl |
+| Structurally precise | partial (vector-first) | ✓ | ✓ | ✓ (SCIP + tree-sitter) |
+| Agent-first output (token-budgeted) | rare | ✗ (human UI) | ✗ (in-IDE) | ✓ |
+| Standalone queryable by *any* agent | some | ✓ (paid/hosted) | ✗ (locked to IDE) | ✓ (MCP) |
+| Incremental | sometimes | ✓ | ✓ | ✓ |
+| Local-first / private | varies | ✗ (mostly) | ✗ | ✓ |
+
+The wedge in one sentence: **the precision of Sourcegraph, the install footprint of ripgrep, the interface of an MCP server, and zero cloud dependency.**
+
+---
+
+## 8. Success metrics
+
+**Adoption (popularity)**
+- GitHub stars trajectory (north-star comparable: Claude Code ~67.5k, tree-sitter-based code tools growing fast). Target: 1k stars in 90 days, 5k in a year.
+- crates.io downloads; number of agents/IDEs listing it as a supported MCP server.
+
+**Technical**
+- Cold index of a 100k-LOC repo in < 10 s on a laptop; 1M-LOC monorepo in < 2 min.
+- Incremental re-index of a single changed file in < 200 ms.
+- Median query latency < 50 ms.
+- Index size < ~15% of source size on disk.
+
+**Value (the thing that drives word-of-mouth)**
+- Measurable token reduction per agent task vs. grep-only baseline (target: 40%+ fewer tokens on multi-file refactor tasks).
+- Reduction in "wrong file edited / missed wiring" errors — directly addresses the most common agent failure mode practitioners complain about (building something correctly but never wiring it in / editing the wrong place).
+
+---
+
+## 9. Monetization paths (in order of effort)
+
+1. **Open-core / OSS first (recommended start).** MIT/Apache core builds the audience and the MCP listings. This category rewards open tools (ripgrep, Biome, tree-sitter are all open and ubiquitous). Popularity is the moat and the lead-gen.
+2. **Paid "team" tier:** shared/persistent index server for monorepos, cross-repo navigation, org-wide governance, multi-user. (Cross-repo + persistence is exactly what the free local tool intentionally doesn't do.)
+3. **Hosted SaaS:** managed indexing for large orgs that don't want to run infra; per-seat or per-repo pricing.
+4. **Sponsorships / GitHub Sponsors** once it's load-bearing infrastructure for other people's agent stacks.
+
+A realistic path to cash flow: ship the OSS binary, get it onto the "best MCP servers" lists and into agent docs, then sell the team/monorepo tier to the orgs who show up because their devs are already using the free version.
+
+---
+
+## 10. Roadmap
+
+**Phase 0 — Spike (1–2 weeks)**
+Tree-sitter parse + symbol extraction for **Rust only**, in-memory graph, `callers`/`callees`/`blast-radius` over the CLI. Prove the speed claim on a real large repo.
+
+**Phase 1 — MVP / OSS launch (4–6 weeks)**
+Embedded on-disk store; incremental re-index via file watcher; **MCP server**; add **TypeScript/JS + Python**. Token-budgeted output contract. `cargo install` + prebuilt release binaries. Launch post + submit to MCP directories.
+
+**Phase 2 — Precision + reach (next quarter)**
+Ingest **SCIP** for compiler-accurate navigation (Rust/TS/Python); add **Go**; structural search query language; commit-aware indexing ("navigate any commit"); auto-generated repo summary tuned for agent context.
+
+**Phase 3 — Team tier**
+Persistent shared index daemon, cross-repo edges, multi-user, optional local semantic layer. Begin monetization.
+
+---
+
+## 11. Key risks & mitigations
+
+| Risk | Mitigation |
+|---|---|
+| Incumbents move fast (Cursor IDE graph, `codegraph` Rust MCP appeared May 2026) | Win on being *standalone + agent-first + multi-language + zero-dep*, not IDE-locked. Ship fast; the niche is wide and still mostly Python. |
+| Symbol resolution accuracy across dynamic languages (Python/JS) | Two-tier model: precise where SCIP exists, fast heuristics elsewhere, always labeled so the agent knows the confidence. Don't over-promise full type inference. |
+| Tree-sitter setup complexity (grammars compile from C) | Bundle precompiled grammars in release binaries; ship WASM fallback for portability. |
+| "Yet another MCP indexer" perception | Lead every benchmark with the speed/footprint gap vs. Python tools, and the precision gap vs. embeddings-only tools. Concrete numbers, not adjectives. |
+| Monetization unclear if everything's free | Deliberately scope cross-repo + persistence + multi-user *out* of the free tier from day one, so the paid tier is a natural upgrade rather than a takeaway. |
+
+---
+
+## 12. Open questions
+- Lead with Rust-only for credibility with the Rust community, or ship TS/Python early for reach? (Recommendation: Rust-only spike for proof, then TS/Python *in the launch* for adoption.)
+- `redb` vs `rusqlite` for the store — benchmark both on the 1M-LOC target before committing.
+- How much of the SCIP ingestion to do in Phase 1 vs. Phase 2 — depends on how good pure tree-sitter resolution tests out on real agent tasks.
+- Naming/availability: confirm `codescope` (or alternatives) is free on crates.io and as a binary name before launch.
+
+---
+
+### Appendix: one-paragraph pitch
+> `codescope` is a single Rust binary that indexes any codebase into a precise, queryable structural graph and serves it to AI coding agents over MCP. Instead of letting your agent grep blindly through files and burn its context window, it answers *"who calls this, what breaks if I change it, where is this defined, what does this module depend on"* in milliseconds, with token-budgeted output. It's the precision of Sourcegraph with the install footprint of ripgrep and no cloud, no database, and no Python. It fills the "Sourcetrail alternative" gap that's gone unanswered for four years — built for the way software actually gets written in 2026: by agents that need a smart codebase more than they need a smarter model.
