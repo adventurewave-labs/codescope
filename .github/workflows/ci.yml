@@ -16,13 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      # ubuntu-latest ships a stable Rust toolchain; just ensure the components
+      # we need are present (avoids third-party toolchain/cache actions).
+      - name: Prepare toolchain
+        run: |
+          rustup component add rustfmt clippy
+          rustc --version && cargo --version
 
       - name: Format check
         run: cargo fmt --all -- --check
