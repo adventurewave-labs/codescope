@@ -1,0 +1,78 @@
+[package]
+name = "codescope"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "A single-binary, blazing-fast code-intelligence engine that turns any repository into a queryable structural graph — purpose-built for AI coding agents."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/marcuspat/codescope"
+keywords = ["code-intelligence", "tree-sitter", "mcp", "code-graph", "ai-agents"]
+categories = ["development-tools", "command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "codescope"
+path = "src/main.rs"
+
+[lib]
+name = "codescope"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+# Repo walking (ignore-aware)
+ignore = "0.4"
+# Parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+streaming-iterator = "0.1"
+# Storage
+redb = "2.1"
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+# Hashing
+seahash = "4.1"
+# Pure-Rust block compression for on-disk records (ADR-0005)
+lz4_flex = "0.11"
+# Concurrency
+rayon = "1.10"
+# Errors & logging
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# File watching (incremental)
+notify = "6.1"
+# Misc
+once_cell = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+
+[features]
+default = []
+# Optional, additive semantic search layer (off by default).
+semantic = []
+
+[[bench]]
+name = "index_bench"
+harness = false
+
+[[bench]]
+name = "query_bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
