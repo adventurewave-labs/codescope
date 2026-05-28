@@ -10,16 +10,6 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  # Diagnostic: a bare job with no marketplace actions and no checkout. If this
-  # passes but `test` fails, the issue is action/checkout resolution; if this
-  # also fails, GitHub-hosted runners aren't usable in this environment.
-  smoke:
-    name: smoke
-    runs-on: ubuntu-latest
-    steps:
-      - name: Echo
-        run: echo "runner ok"
-
   test:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
