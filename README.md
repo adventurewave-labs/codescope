@@ -1,5 +1,11 @@
 # codescope
 
+[![Crates.io](https://img.shields.io/crates/v/codescope.svg)](https://crates.io/crates/codescope)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](#license)
+[![Build](https://github.com/adventurewave-labs/codescope/actions/workflows/ci.yml/badge.svg)](https://github.com/adventurewave-labs/codescope/actions)
+
+> ⭐ If codescope saves you context tokens, [starring the repo](https://github.com/adventurewave-labs/codescope) helps others find it.
+
 **A single-binary, blazing-fast code-intelligence engine for AI coding agents.**
 
 `codescope` indexes any repository into a precise, queryable structural graph and
@@ -10,6 +16,10 @@ depend on"* in milliseconds — with **token-budgeted** output.
 
 The precision of Sourcegraph, the install footprint of ripgrep, the interface of
 an MCP server, and no cloud, no database, no Python.
+
+## Demo
+
+> 📹 **Demo GIF coming soon.** Capture with [`vhs`](https://github.com/charmbracelet/vhs) or `asciinema` + [`agg`](https://github.com/asciinema/agg): run `codescope index` then `codescope callers <symbol>` to show the structural query in action.
 
 ## Capabilities
 
@@ -121,6 +131,15 @@ repo → Walker (ignore-aware) → tree-sitter parsers → Symbol/edge extractio
   bounded contexts, domain model, services & repositories.
 - **Benchmarks & validation:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 - **Product requirements:** [`plans/codescope.prd`](plans/codescope.prd).
+
+## Ecosystem
+
+| Repo | What it does |
+|------|-------------|
+| [**secret-scan**](https://github.com/adventurewave-labs/secret-scan) | Rust secret scanner — 51k files/sec, 99% accuracy, obfuscation detection |
+| [**Sentinel**](https://github.com/marcuspat/Sentinel) | Deny-by-default agentic sysadmin: Investigate → Plan → Approve → Act |
+| [**spacelift-intent**](https://github.com/marcuspat/spacelift-intent) | Natural language → cloud infra via Terraform providers, no HCL |
+| [**turbo-flow**](https://github.com/adventurewave-labs/turbo-flow) | Agentic dev environment — 600+ AI subagents, SPARC methodology |
 
 ## License
 
