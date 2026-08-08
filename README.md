@@ -8,6 +8,12 @@
 
 **A single-binary, blazing-fast code-intelligence engine for AI coding agents.**
 
+## 🎬 Demo
+
+![codescope indexing itself and answering blast-radius queries](demo.gif)
+
+*codescope indexing its own repo — 196 symbols, 1,322 edges in 188 ms — then a summary and a blast-radius query. Recorded from the actual binary with [asciinema](https://asciinema.org) + [agg](https://github.com/asciinema/agg).*
+
 `codescope` indexes any repository into a precise, queryable structural graph and
 serves it to AI agents over **MCP** (and CLI/JSON). Instead of letting an agent
 grep blindly through files and burn its context window, it answers *"who calls
