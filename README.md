@@ -17,10 +17,6 @@ depend on"* in milliseconds — with **token-budgeted** output.
 The precision of Sourcegraph, the install footprint of ripgrep, the interface of
 an MCP server, and no cloud, no database, no Python.
 
-## Demo
-
-> 📹 **Demo GIF coming soon.** Capture with [`vhs`](https://github.com/charmbracelet/vhs) or `asciinema` + [`agg`](https://github.com/asciinema/agg): run `codescope index` then `codescope callers <symbol>` to show the structural query in action.
-
 ## Capabilities
 
 | Capability | CLI | MCP tool |
