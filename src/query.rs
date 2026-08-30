@@ -155,7 +155,7 @@ pub fn references(graph: &CodeGraph, name: &str, max_tokens: usize) -> QueryResu
             hits.push((e.from, e.line, e.confidence.name()));
         }
     }
-    hits.sort_by(|a, b| a.1.cmp(&b.1));
+    hits.sort_by_key(|a| a.1);
     for (from, line, conf) in hits {
         if let Some(s) = graph.symbol(from) {
             let mut v = SymbolView::from_symbol(s);
@@ -470,7 +470,7 @@ pub fn repo_summary(graph: &CodeGraph, max_tokens: usize) -> RepoSummary {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
-    languages.sort_by(|a, b| b.1.cmp(&a.1));
+    languages.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     let mut top_modules: Vec<ModuleSummary> = file_syms
         .into_iter()
