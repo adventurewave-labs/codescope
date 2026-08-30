@@ -1,6 +1,5 @@
 # codescope
 
-[![Crates.io](https://img.shields.io/crates/v/codescope.svg)](https://crates.io/crates/codescope)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](#license)
 [![Build](https://github.com/adventurewave-labs/codescope/actions/workflows/ci.yml/badge.svg)](https://github.com/adventurewave-labs/codescope/actions)
 
