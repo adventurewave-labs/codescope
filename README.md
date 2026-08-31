@@ -139,7 +139,7 @@ repo → Walker (ignore-aware) → tree-sitter parsers → Symbol/edge extractio
 |------|-------------|
 | [**secret-scan**](https://github.com/adventurewave-labs/secret-scan) | Rust secret scanner — pattern + entropy-based detection, Base64/hex obfuscation detection |
 | [**Sentinel**](https://github.com/marcuspat/Sentinel) | Deny-by-default agentic sysadmin: Investigate → Plan → Approve → Act |
-| [**turbo-flow**](https://github.com/marcuspat/turbo-flow) | Agentic dev environment — Ruflo v3.5 orchestration, 60+ agents, git-worktree isolation |
+| [**turbo-flow**](https://github.com/marcuspat/turbo-flow) | Agentic dev environment — Ruflo v3.5 orchestration (by [ruvnet](https://github.com/ruvnet)), 60+ agents, git-worktree isolation |
 
 ## License
 
