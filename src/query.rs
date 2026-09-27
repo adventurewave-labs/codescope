@@ -7,14 +7,15 @@
 //! than dumping the whole graph (the output contract from the PRD).
 
 use crate::domain::{CodeGraph, EdgeKind, Symbol, SymbolId, SymbolKind};
+use crate::rank;
 use serde::Serialize;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Default token budget for a single query answer.
 pub const DEFAULT_MAX_TOKENS: usize = 4000;
 
 /// Rough token estimate (~4 chars/token, ADR-0011).
-fn est_tokens(chars: usize) -> usize {
+pub(crate) fn est_tokens(chars: usize) -> usize {
     chars / 4 + 1
 }
 
@@ -41,7 +42,7 @@ pub struct SymbolView {
 }
 
 impl SymbolView {
-    fn from_symbol(s: &Symbol) -> SymbolView {
+    pub(crate) fn from_symbol(s: &Symbol) -> SymbolView {
         SymbolView {
             id: s.id.to_string(),
             name: s.name.clone(),
@@ -57,7 +58,7 @@ impl SymbolView {
         }
     }
 
-    fn est(&self) -> usize {
+    pub(crate) fn est(&self) -> usize {
         est_tokens(self.name.len() + self.signature.len() + self.file.len() + 64)
     }
 }
@@ -70,10 +71,13 @@ pub struct QueryResult {
     pub count: usize,
     pub truncated: bool,
     pub results: Vec<SymbolView>,
+    /// "Did you mean" candidates when the query target matched nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
 }
 
 /// Accumulate views under a token budget, truncating when exceeded.
-struct Budget {
+pub(crate) struct Budget {
     max_tokens: usize,
     used: usize,
     items: Vec<SymbolView>,
@@ -81,7 +85,7 @@ struct Budget {
 }
 
 impl Budget {
-    fn new(max_tokens: usize) -> Self {
+    pub(crate) fn new(max_tokens: usize) -> Self {
         Budget {
             max_tokens,
             used: 0,
@@ -92,7 +96,7 @@ impl Budget {
 
     /// Try to add a view. Returns false (and sets `truncated`) if the budget is
     /// exhausted.
-    fn push(&mut self, v: SymbolView) -> bool {
+    pub(crate) fn push(&mut self, v: SymbolView) -> bool {
         let cost = v.est();
         if self.used + cost > self.max_tokens && !self.items.is_empty() {
             self.truncated = true;
@@ -110,30 +114,111 @@ impl Budget {
             count: self.items.len(),
             truncated: self.truncated,
             results: self.items,
+            suggestions: Vec::new(),
         }
     }
 }
 
+/// Attach "did you mean" suggestions when a named target resolved to nothing.
+fn with_suggestions(
+    mut r: QueryResult,
+    graph: &CodeGraph,
+    target: &str,
+    roots_empty: bool,
+) -> QueryResult {
+    if roots_empty {
+        r.suggestions = suggest(graph, target, 5);
+    }
+    r
+}
+
+/// Rank known symbol names by closeness to `target` (case-insensitive exact,
+/// then substring, then bounded Levenshtein distance).
+pub fn suggest(graph: &CodeGraph, target: &str, limit: usize) -> Vec<String> {
+    let t = last_segment(target).to_lowercase();
+    if t.is_empty() {
+        return Vec::new();
+    }
+    let max_dist = (t.chars().count() / 3).max(2);
+    let mut scored: Vec<(usize, String)> = graph
+        .names()
+        .filter_map(|name| {
+            let n = name.to_lowercase();
+            let score = if n == t {
+                0
+            } else if n.contains(&t) || t.contains(&n) && n.len() >= 3 {
+                1 + n.len().abs_diff(t.len())
+            } else {
+                let d = levenshtein(&n, &t);
+                if d > max_dist {
+                    return None;
+                }
+                100 + d
+            };
+            Some((score, name.to_string()))
+        })
+        .collect();
+    scored.sort();
+    scored.dedup_by(|a, b| a.1 == b.1);
+    scored.into_iter().take(limit).map(|(_, n)| n).collect()
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+fn last_segment(target: &str) -> &str {
+    target
+        .rsplit("::")
+        .next()
+        .and_then(|s| s.rsplit('.').next())
+        .unwrap_or(target)
+}
+
 /// Resolve a free-form target (symbol name or file path) to starting symbols.
-fn resolve_targets(graph: &CodeGraph, target: &str) -> Vec<SymbolId> {
+pub(crate) fn resolve_targets(graph: &CodeGraph, target: &str) -> Vec<SymbolId> {
     // File path? Use every symbol defined in that file.
     let by_file = graph.by_file(target);
     if !by_file.is_empty() {
         return by_file.to_vec();
     }
     // Otherwise treat as a symbol name (match on last path segment too).
-    let name = target
-        .rsplit("::")
-        .next()
-        .and_then(|s| s.rsplit('.').next())
-        .unwrap_or(target);
-    graph.by_name(name).to_vec()
+    // A bare name can match both a file's synthetic module symbol and a real
+    // declaration (e.g. `parser` the module vs. `parser` the fn); prefer the
+    // declarations and fall back to the module only if nothing else matches.
+    let ids = graph.by_name(last_segment(target));
+    let decls: Vec<SymbolId> = ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            graph
+                .symbol(*id)
+                .is_some_and(|s| s.kind != SymbolKind::Module)
+        })
+        .collect();
+    if decls.is_empty() {
+        ids.to_vec()
+    } else {
+        decls
+    }
 }
 
 /// `definition`: where is this symbol declared.
 pub fn definition(graph: &CodeGraph, name: &str, max_tokens: usize) -> QueryResult {
     let mut budget = Budget::new(max_tokens);
     let mut ids = resolve_targets(graph, name);
+    let empty = ids.is_empty();
     ids.sort();
     for id in ids {
         if let Some(s) = graph.symbol(id) {
@@ -142,13 +227,19 @@ pub fn definition(graph: &CodeGraph, name: &str, max_tokens: usize) -> QueryResu
             }
         }
     }
-    budget.finish(name.to_string(), "definition")
+    with_suggestions(
+        budget.finish(name.to_string(), "definition"),
+        graph,
+        name,
+        empty,
+    )
 }
 
 /// `references`: every use site that resolves to the named symbol.
 pub fn references(graph: &CodeGraph, name: &str, max_tokens: usize) -> QueryResult {
     let mut budget = Budget::new(max_tokens);
     let targets: HashSet<SymbolId> = resolve_targets(graph, name).into_iter().collect();
+    let empty = targets.is_empty();
     let mut hits: Vec<(SymbolId, u32, &'static str)> = Vec::new();
     for t in &targets {
         for e in graph.in_edges(*t) {
@@ -166,26 +257,27 @@ pub fn references(graph: &CodeGraph, name: &str, max_tokens: usize) -> QueryResu
             }
         }
     }
-    budget.finish(name.to_string(), "references")
+    with_suggestions(
+        budget.finish(name.to_string(), "references"),
+        graph,
+        name,
+        empty,
+    )
 }
 
-/// Generic transitive BFS over edges of `edge_kind`, following either outgoing
-/// (callees) or incoming (callers/dependents) edges.
-#[allow(clippy::too_many_arguments)]
-fn traverse(
+/// Transitive BFS reachability over edges of `edge_kinds`, following either
+/// outgoing (callees) or incoming (callers/dependents) edges. Returns each
+/// reached symbol (excluding roots) with its BFS depth, in BFS order.
+pub(crate) fn reach(
     graph: &CodeGraph,
     roots: &[SymbolId],
     edge_kinds: &[EdgeKind],
     incoming: bool,
     max_depth: u32,
-    max_tokens: usize,
-    query: String,
-    result_kind: &'static str,
-) -> QueryResult {
-    let mut budget = Budget::new(max_tokens);
+) -> Vec<(SymbolId, u32)> {
+    let mut out = Vec::new();
     let mut seen: HashSet<SymbolId> = roots.iter().copied().collect();
     let mut queue: VecDeque<(SymbolId, u32)> = roots.iter().map(|&r| (r, 0)).collect();
-
     while let Some((id, depth)) = queue.pop_front() {
         if depth >= max_depth {
             continue;
@@ -205,18 +297,38 @@ fn traverse(
         };
         for n in neighbors {
             if seen.insert(n) {
-                if let Some(s) = graph.symbol(n) {
-                    let mut v = SymbolView::from_symbol(s);
-                    v.depth = Some(depth + 1);
-                    if !budget.push(v) {
-                        return budget.finish(query, result_kind);
-                    }
-                }
+                out.push((n, depth + 1));
                 queue.push_back((n, depth + 1));
             }
         }
     }
-    budget.finish(query, result_kind)
+    out
+}
+
+/// Budgeted wrapper over [`reach`].
+#[allow(clippy::too_many_arguments)]
+fn traverse(
+    graph: &CodeGraph,
+    roots: &[SymbolId],
+    edge_kinds: &[EdgeKind],
+    incoming: bool,
+    max_depth: u32,
+    max_tokens: usize,
+    query: String,
+    result_kind: &'static str,
+) -> QueryResult {
+    let mut budget = Budget::new(max_tokens);
+    for (id, depth) in reach(graph, roots, edge_kinds, incoming, max_depth) {
+        if let Some(s) = graph.symbol(id) {
+            let mut v = SymbolView::from_symbol(s);
+            v.depth = Some(depth);
+            if !budget.push(v) {
+                break;
+            }
+        }
+    }
+    let r = budget.finish(query.clone(), result_kind);
+    with_suggestions(r, graph, &query, roots.is_empty())
 }
 
 /// `callers`: who (transitively) calls the named symbol.
@@ -459,7 +571,6 @@ pub struct ModuleSummary {
 /// `repo_summary`: a token-bounded architectural overview — the "read this
 /// before you touch anything" artifact, generated rather than hand-written.
 pub fn repo_summary(graph: &CodeGraph, max_tokens: usize) -> RepoSummary {
-    use std::collections::HashMap;
     let mut lang_counts: HashMap<&'static str, usize> = HashMap::new();
     let mut file_syms: HashMap<String, usize> = HashMap::new();
     for s in graph.symbols() {
@@ -479,21 +590,19 @@ pub fn repo_summary(graph: &CodeGraph, max_tokens: usize) -> RepoSummary {
     top_modules.sort_by(|a, b| b.symbols.cmp(&a.symbols).then(a.file.cmp(&b.file)));
     top_modules.truncate(15);
 
-    // Key symbols: rank by in-edge (reference/call) count.
-    let mut ranked: Vec<(SymbolId, usize)> = graph
-        .symbols()
-        .filter(|s| s.kind != SymbolKind::Module)
-        .map(|s| (s.id, graph.in_edges(s.id).count()))
+    // Key symbols: rank by PageRank centrality (ADR-0015) — transitive
+    // importance, not raw in-degree. Symbols nothing depends on are skipped.
+    let pr = rank::pagerank(graph, &[]);
+    let mut ranked: Vec<(SymbolId, f64)> = pr
+        .into_iter()
+        .filter(|(id, _)| graph.in_edges(*id).any(|e| e.kind != EdgeKind::Contains))
         .collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
 
     // Budget the key symbol list (the largest, variable part of the summary).
     let overhead = est_tokens(languages.iter().map(|(l, _)| l.len() + 8).sum::<usize>() + 256);
     let mut budget = Budget::new(max_tokens.saturating_sub(overhead.min(max_tokens / 2)));
-    for (id, refs) in ranked.into_iter().take(50) {
-        if refs == 0 {
-            break;
-        }
+    for (id, _) in ranked.into_iter().take(50) {
         if let Some(s) = graph.symbol(id) {
             if !budget.push(SymbolView::from_symbol(s)) {
                 break;
@@ -511,6 +620,125 @@ pub fn repo_summary(graph: &CodeGraph, max_tokens: usize) -> RepoSummary {
         top_modules,
         key_symbols,
         truncated,
+    }
+}
+
+/// One symbol line in a [`RepoMap`].
+#[derive(Debug, Clone, Serialize)]
+pub struct MapSymbol {
+    pub name: String,
+    pub kind: &'static str,
+    pub line: u32,
+    pub signature: String,
+    /// PageRank score scaled so the top symbol is 1.0.
+    pub rank: f32,
+}
+
+/// A file section in a [`RepoMap`], ordered by its best symbol's rank.
+#[derive(Debug, Clone, Serialize)]
+pub struct MapFile {
+    pub file: String,
+    pub symbols: Vec<MapSymbol>,
+}
+
+/// An Aider-style ranked repository map: the most structurally important
+/// signatures that fit in the token budget, grouped by file (ADR-0015).
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoMap {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub focus: Vec<String>,
+    pub file_count: usize,
+    pub symbol_count: usize,
+    pub truncated: bool,
+    pub files: Vec<MapFile>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
+}
+
+/// `repo_map`: rank every symbol with (personalized) PageRank and emit the
+/// top signatures grouped by file until `max_tokens` is spent.
+///
+/// `focus` entries are symbol names or file paths the agent is working on; they
+/// personalize the ranking so the map shows what matters *around* them.
+pub fn repo_map(graph: &CodeGraph, focus: &[String], max_tokens: usize) -> RepoMap {
+    let mut focus_ids: Vec<SymbolId> = Vec::new();
+    let mut suggestions = Vec::new();
+    for f in focus {
+        let ids = resolve_targets(graph, f);
+        if ids.is_empty() {
+            suggestions.extend(suggest(graph, f, 3));
+        }
+        focus_ids.extend(ids);
+    }
+    let pr = rank::pagerank(graph, &focus_ids);
+    let top = pr
+        .values()
+        .copied()
+        .fold(0.0f64, f64::max)
+        .max(f64::MIN_POSITIVE);
+
+    let mut ranked: Vec<(&Symbol, f64)> = pr
+        .iter()
+        .filter_map(|(id, r)| graph.symbol(*id).map(|s| (s, *r)))
+        .filter(|(s, _)| !matches!(s.kind, SymbolKind::Import | SymbolKind::Field))
+        // Test code is noise when orienting in a codebase.
+        .filter(|(s, _)| !crate::diff::is_test(graph, s))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then(a.0.file.cmp(&b.0.file))
+            .then(a.0.span.line_start.cmp(&b.0.span.line_start))
+    });
+
+    let mut used = 0usize;
+    let mut truncated = false;
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<MapSymbol>> = HashMap::new();
+    let mut count = 0usize;
+    for (s, r) in ranked {
+        let sig = if s.signature.is_empty() {
+            s.name.clone()
+        } else {
+            s.signature.clone()
+        };
+        let mut cost = est_tokens(sig.len() + 8);
+        if !groups.contains_key(&s.file) {
+            cost += est_tokens(s.file.len() + 2);
+        }
+        if used + cost > max_tokens && count > 0 {
+            truncated = true;
+            break;
+        }
+        used += cost;
+        count += 1;
+        if !groups.contains_key(&s.file) {
+            order.push(s.file.clone());
+        }
+        groups.entry(s.file.clone()).or_default().push(MapSymbol {
+            name: s.name.clone(),
+            kind: s.kind.name(),
+            line: s.span.line_start,
+            signature: sig,
+            rank: (r / top) as f32,
+        });
+    }
+
+    let files: Vec<MapFile> = order
+        .into_iter()
+        .map(|file| {
+            let mut symbols = groups.remove(&file).unwrap_or_default();
+            symbols.sort_by_key(|m| m.line);
+            MapFile { file, symbols }
+        })
+        .collect();
+
+    RepoMap {
+        focus: focus.to_vec(),
+        file_count: files.len(),
+        symbol_count: count,
+        truncated,
+        files,
+        suggestions,
     }
 }
 
@@ -580,6 +808,53 @@ mod tests {
         assert_eq!(s.file_count, 2);
         assert!(s.languages.iter().any(|(l, _)| l == "rust"));
         assert!(s.languages.iter().any(|(l, _)| l == "python"));
+    }
+
+    #[test]
+    fn suggestions_on_miss() {
+        let g = graph_from(&[("a.rs", "fn parse_query() {}\nfn other() {}\n")]);
+        let r = definition(&g, "parse_qeury", DEFAULT_MAX_TOKENS);
+        assert_eq!(r.count, 0);
+        assert_eq!(
+            r.suggestions.first().map(String::as_str),
+            Some("parse_query")
+        );
+        let r = callers(&g, "parse", 2, DEFAULT_MAX_TOKENS);
+        assert!(r.suggestions.contains(&"parse_query".to_string()));
+        // A hit never carries suggestions.
+        assert!(definition(&g, "other", DEFAULT_MAX_TOKENS)
+            .suggestions
+            .is_empty());
+    }
+
+    #[test]
+    fn repo_map_ranks_and_budgets() {
+        let g = graph_from(&[
+            ("core.rs", "pub fn hub() {}\nfn unused_helper() {}\n"),
+            ("a.rs", "fn a1() { hub(); }\nfn a2() { hub(); }\n"),
+            ("b.rs", "fn b1() { hub(); }\n"),
+        ]);
+        let m = repo_map(&g, &[], DEFAULT_MAX_TOKENS);
+        assert_eq!(m.files[0].file, "core.rs", "hub's file ranks first");
+        assert!(m.files[0]
+            .symbols
+            .iter()
+            .any(|s| s.name == "hub" && s.rank == 1.0));
+        let tiny = repo_map(&g, &[], 5);
+        assert!(tiny.truncated);
+        assert_eq!(tiny.symbol_count, 1);
+    }
+
+    #[test]
+    fn repo_map_focus_personalizes() {
+        let g = graph_from(&[
+            ("x.rs", "fn x_dep() {}\nfn x() { x_dep(); }\n"),
+            ("y.rs", "fn y_dep() {}\nfn y() { y_dep(); }\n"),
+        ]);
+        let m = repo_map(&g, &["y.rs".to_string()], DEFAULT_MAX_TOKENS);
+        assert_eq!(m.files[0].file, "y.rs");
+        let m = repo_map(&g, &["x".to_string()], DEFAULT_MAX_TOKENS);
+        assert_eq!(m.files[0].file, "x.rs");
     }
 
     #[test]
