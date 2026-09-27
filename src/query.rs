@@ -46,6 +46,15 @@ pub struct SymbolView {
     /// was heuristically bound (omitted when unambiguous).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ambiguity: Option<u16>,
+    /// `find` only: fused relevance, normalized so the top hit is 1.0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f32>,
+    /// `find` only: normalized query terms this symbol matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched: Option<Vec<String>>,
+    /// `find` only: the symbol's doc comment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
 }
 
 impl SymbolView {
@@ -64,6 +73,9 @@ impl SymbolView {
             site_line: None,
             confidence: None,
             ambiguity: None,
+            score: None,
+            matched: None,
+            doc: None,
         }
     }
 
@@ -73,6 +85,11 @@ impl SymbolView {
                 + self.signature.len()
                 + self.file.len()
                 + self.owner.as_ref().map_or(0, |o| o.len() + 10)
+                + self.doc.as_ref().map_or(0, |d| d.len() + 8)
+                + self
+                    .matched
+                    .as_ref()
+                    .map_or(0, |m| m.iter().map(|t| t.len() + 3).sum::<usize>() + 12)
                 + 64,
         )
     }
@@ -122,7 +139,7 @@ impl Budget {
         true
     }
 
-    fn finish(self, query: String, kind: &'static str) -> QueryResult {
+    pub(crate) fn finish(self, query: String, kind: &'static str) -> QueryResult {
         QueryResult {
             query,
             kind,
@@ -556,7 +573,7 @@ pub fn structural_search(graph: &CodeGraph, query: &str, max_tokens: usize) -> Q
     budget.finish(query.to_string(), "structural_search")
 }
 
-enum Filter {
+pub(crate) enum Filter {
     Kind(String),
     Lang(String),
     File(String),
@@ -568,7 +585,7 @@ enum Filter {
 }
 
 impl Filter {
-    fn matches(&self, s: &Symbol, graph: &CodeGraph) -> bool {
+    pub(crate) fn matches(&self, s: &Symbol, graph: &CodeGraph) -> bool {
         match self {
             Filter::Kind(k) => s.kind.name().eq_ignore_ascii_case(k),
             Filter::Lang(l) => s.language.name().eq_ignore_ascii_case(l),
@@ -588,6 +605,19 @@ impl Filter {
                 .any(|e| e.kind == EdgeKind::Calls && e.to_name.contains(callee.as_str())),
         }
     }
+}
+
+/// Split a query into structural filters (`key:value`) and free-text words.
+pub(crate) fn split_filters(query: &str) -> (Vec<Filter>, Vec<String>) {
+    let mut filters = Vec::new();
+    let mut words = Vec::new();
+    for f in parse_query(query) {
+        match f {
+            Filter::Text(t) => words.push(t),
+            other => filters.push(other),
+        }
+    }
+    (filters, words)
 }
 
 fn parse_query(query: &str) -> Vec<Filter> {

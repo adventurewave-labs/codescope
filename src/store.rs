@@ -21,7 +21,7 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// On-disk record format version. Bump whenever `SourceFile`/`Symbol`/`Edge`
 /// change shape: a mismatched index is discarded and rebuilt on next index
 /// rather than failing to decode (ADR-0005).
-pub const SCHEMA_VERSION: &str = "2";
+pub const SCHEMA_VERSION: &str = "3";
 
 /// Full index-compatibility key: record schema + crate version + extraction
 /// query fingerprint, so upgrading

@@ -68,6 +68,9 @@ pub enum Command {
     Search { query: Vec<String> },
     /// Token-bounded architectural overview.
     Summary,
+    /// Find code by what it does, in plain language (hybrid BM25F + PageRank).
+    /// Structural filters (kind:, lang:, file:, owner:) may be mixed in.
+    Find { query: Vec<String> },
     /// PageRank-ranked repo map of the most important signatures, grouped by
     /// file. Optional focus symbols/files personalize the ranking.
     Map { focus: Vec<String> },
@@ -312,6 +315,37 @@ pub fn run(cli: Cli) -> Result<()> {
                         println!("\nkey symbols:");
                         for v in &s.key_symbols {
                             println!("  {} {} — {}:{}", v.kind, v.name, v.file, v.line_start);
+                        }
+                    }
+                }
+                Command::Find { query } => {
+                    let idx = crate::search::SearchIndex::build(graph);
+                    let r = crate::search::find(graph, &idx, &query.join(" "), max_tokens);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "# find ({} result{}{})",
+                            r.count,
+                            if r.count == 1 { "" } else { "s" },
+                            if r.truncated { ", truncated" } else { "" }
+                        );
+                        for v in &r.results {
+                            let name = match &v.owner {
+                                Some(o) => format!("{o}::{}", v.name),
+                                None => v.name.clone(),
+                            };
+                            println!(
+                                "  {:.2}  {} {name} — {}:{}",
+                                v.score.unwrap_or(0.0),
+                                v.kind,
+                                v.file,
+                                v.line_start
+                            );
+                            if let Some(d) = &v.doc {
+                                let short: String = d.chars().take(100).collect();
+                                println!("        {short}");
+                            }
                         }
                     }
                 }
