@@ -18,3 +18,6 @@ This directory records the architecture decisions for `codescope`, written in th
 | [0012](0012-optional-semantic-layer.md) | Optional Semantic Layer | Accepted |
 | [0013](0013-error-handling-and-observability.md) | Error Handling & Observability | Accepted |
 | [0014](0014-testing-benchmarking-release.md) | Testing, Benchmarking & Release | Accepted |
+| [0015](0015-pagerank-repo-map.md) | PageRank Repo Map & Centrality | Accepted |
+| [0016](0016-diff-impact.md) | Diff-Driven Change Impact | Accepted |
+| [0017](0017-mcp-2025-06-18.md) | MCP 2025-06-18 Alignment | Accepted |

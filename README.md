@@ -35,6 +35,8 @@ an MCP server, and no cloud, no database, no Python.
 | File/module import graph + cycles | `codescope deps` | `cs_dependency_graph` |
 | Structural search | `codescope search "kind:function calls:db_query"` | `cs_structural_search` |
 | Architectural overview | `codescope summary` | `cs_repo_summary` |
+| PageRank repo map (optionally focused) | `codescope map [focus…]` | `cs_repo_map` |
+| Change impact of your diff + tests to run | `codescope diff-impact [--base REF]` | `cs_diff_impact` |
 
 **Languages:** Rust, TypeScript, JavaScript, Python, Go (tree-sitter).
 
@@ -61,6 +63,9 @@ codescope refs UserSession
 codescope summary --max-tokens 4000
 codescope search "kind:function calls:db.query returns:Result"
 codescope callees do_thing --json     # machine-readable output
+codescope map --max-tokens 1500       # ranked repo map (Aider-style)
+codescope map src/auth.rs login       # map personalized to what you're editing
+codescope diff-impact --base main     # what your branch changed/affects + tests to run
 ```
 
 ### Structural search
@@ -127,7 +132,7 @@ repo → Walker (ignore-aware) → tree-sitter parsers → Symbol/edge extractio
 
 ## Documentation
 
-- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (14 ADRs).
+- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (17 ADRs).
 - **Domain-Driven Design:** [`docs/ddd/`](docs/ddd/) — ubiquitous language,
   bounded contexts, domain model, services & repositories.
 - **Benchmarks & validation:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).

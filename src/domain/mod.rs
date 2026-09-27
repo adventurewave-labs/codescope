@@ -353,6 +353,11 @@ impl CodeGraph {
         self.by_name.get(name).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
+    /// Every distinct symbol name in the graph.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(String::as_str)
+    }
+
     /// Symbols defined in a file path.
     pub fn by_file(&self, path: &str) -> &[SymbolId] {
         self.by_file.get(path).map(|v| v.as_slice()).unwrap_or(&[])

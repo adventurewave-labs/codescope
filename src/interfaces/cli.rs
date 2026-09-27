@@ -63,6 +63,17 @@ pub enum Command {
     Search { query: Vec<String> },
     /// Token-bounded architectural overview.
     Summary,
+    /// PageRank-ranked repo map of the most important signatures, grouped by
+    /// file. Optional focus symbols/files personalize the ranking.
+    Map { focus: Vec<String> },
+    /// Change impact of the working tree vs. a git base: changed symbols,
+    /// transitive dependents, and the tests worth running.
+    #[command(name = "diff-impact")]
+    DiffImpact {
+        /// Git base to diff against (default HEAD).
+        #[arg(long)]
+        base: Option<String>,
+    },
     /// Start the MCP server over stdio.
     Serve {
         /// Serve the MCP protocol over stdio (default and only mode).
@@ -107,6 +118,43 @@ pub fn run(cli: Cli) -> Result<()> {
             anyhow::ensure!(mcp, "only --mcp (stdio) is supported");
             let path = cli.path.clone();
             crate::interfaces::mcp::serve_stdio(path)?;
+        }
+        Command::DiffImpact { base } => {
+            // Refresh first so symbol spans match the working tree.
+            let mut store = open_store(&cli.path)?;
+            index::build_index(&cli.path, &mut store).context("indexing failed")?;
+            let graph = store.load_graph()?;
+            let changes = crate::diff::git_changes(&cli.path, base.as_deref())?;
+            let base = base.unwrap_or_else(|| "HEAD".into());
+            let r = crate::diff::diff_impact(&graph, &changes, &base, max_tokens);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                let k = &r.risk;
+                println!(
+                    "# diff-impact vs {} — {} file(s), {} changed symbol(s) → {} impacted in {} file(s), {} test(s){}",
+                    r.base,
+                    k.files_changed,
+                    k.symbols_changed,
+                    k.symbols_impacted,
+                    k.files_impacted,
+                    k.tests_impacted,
+                    if r.truncated { " (truncated)" } else { "" }
+                );
+                let section = |title: &str, items: &[query::SymbolView]| {
+                    if items.is_empty() {
+                        return;
+                    }
+                    println!("\n{title}:");
+                    for v in items {
+                        let d = v.depth.map(|d| format!("[d{d}] ")).unwrap_or_default();
+                        println!("  {d}{} {} — {}:{}", v.kind, v.name, v.file, v.line_start);
+                    }
+                };
+                section("changed", &r.changed_symbols);
+                section("tests to run", &r.impacted_tests);
+                section("impacted", &r.impacted);
+            }
         }
         other => {
             // All remaining verbs are read-only queries over the loaded graph.
@@ -187,7 +235,29 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
                     }
                 }
-                _ => unreachable!("index/serve handled above"),
+                Command::Map { focus } => {
+                    let m = query::repo_map(&graph, &focus, max_tokens);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&m)?);
+                    } else {
+                        for f in &m.files {
+                            println!("{}:", f.file);
+                            for s in &f.symbols {
+                                println!("  {:>5}│ {}", s.line, s.signature);
+                            }
+                        }
+                        if m.truncated {
+                            println!("… (truncated at --max-tokens {max_tokens})");
+                        }
+                        if !m.suggestions.is_empty() {
+                            println!(
+                                "focus not found; did you mean: {}",
+                                m.suggestions.join(", ")
+                            );
+                        }
+                    }
+                }
+                _ => unreachable!("index/serve/diff-impact handled above"),
             }
         }
     }
@@ -214,6 +284,12 @@ fn emit(result: QueryResult, json: bool) {
         if result.count == 1 { "" } else { "s" },
         if result.truncated { ", truncated" } else { "" }
     );
+    if !result.suggestions.is_empty() {
+        println!(
+            "  no match — did you mean: {}",
+            result.suggestions.join(", ")
+        );
+    }
     for v in &result.results {
         let depth = v.depth.map(|d| format!("[d{d}] ")).unwrap_or_default();
         let site = v

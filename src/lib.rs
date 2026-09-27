@@ -10,14 +10,18 @@
 //! * [`store`] — embedded redb persistence.
 //! * [`index`] — indexing orchestration (parallel + incremental).
 //! * [`query`] — agent-facing query application services.
+//! * [`rank`] — PageRank centrality for repo maps and summaries.
+//! * [`diff`] — git-diff change-impact analysis.
 //! * [`interfaces`] — CLI / JSON / MCP surfaces.
 
+pub mod diff;
 pub mod domain;
 pub mod extract;
 pub mod index;
 pub mod interfaces;
 pub mod parser;
 pub mod query;
+pub mod rank;
 pub mod resolve;
 pub mod store;
 pub mod walker;
