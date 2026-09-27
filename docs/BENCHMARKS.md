@@ -108,3 +108,14 @@ Release build, 4-core container, `cargo run --release --example fresh_latency --
 `cargo test --test find_relevance -- --nocapture` — 16 behavior-phrased queries over codescope's own source:
 **MRR 0.693 · R@1 0.56 · R@5 0.88** (baseline BM25F+RRF before file-docs/test-downweight: 0.644 / 0.56 / 0.75).
 CLI `find` end-to-end: 115 ms (gson, 4.5k symbols), 690 ms (dotnet/samples, 25k symbols).
+
+## Call-resolution accuracy (ADR-0022)
+
+`scripts/eval` — 85 annotated call sites across 10 languages (`tests/eval/`):
+
+| Precision | Recall | F1 | Accuracy |
+|---|---|---|---|
+| 1.00 | 0.97 | 0.98 | 0.98 |
+
+Before the ADR-0022 fixes (class instantiation, field-receiver inference, `dyn Trait`): 1.00 / 0.78.
+Per-language table and the remaining misses: [`EVAL.md`](EVAL.md).

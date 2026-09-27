@@ -262,7 +262,9 @@ fn resolve_one(
                 if c.owner.as_deref() == Some(q) {
                     score += 16;
                 } else if q == c.stem || q == c.dir {
-                    score += 8;
+                    // `module::f()` names a module member: prefer its free
+                    // functions over same-named methods in that module.
+                    score += if c.owner.is_none() { 9 } else { 8 };
                 }
             }
             None => {
@@ -296,6 +298,29 @@ fn resolve_one(
             }
         }
     }
+    // Instantiation without an explicit constructor: `Repo()`, `new Repo()`,
+    // Ruby `Repo.new` — a capitalized callee with no callable candidate binds
+    // to the class/struct itself.
+    if best.is_none()
+        && edge.kind == EdgeKind::Calls
+        && name.starts_with(|c: char| c.is_ascii_uppercase())
+    {
+        let classes: Vec<&Cand> = candidates
+            .iter()
+            .filter(|c| matches!(c.kind, SymbolKind::Class | SymbolKind::Struct))
+            .collect();
+        let pick = classes
+            .iter()
+            .max_by_key(|c| {
+                (
+                    u32::from(c.file == caller.file) * 4 + file_imports.score(c),
+                    std::cmp::Reverse(c.id),
+                )
+            })
+            .map(|c| c.id);
+        return pick.map(|id| (id, classes.len().saturating_sub(1) as u16));
+    }
+
     // A call through an arbitrary variable (`items.push(x)`) with no
     // supporting evidence — not same-file, not imported, no owner/module
     // match — is far more likely a std/third-party method than whichever repo

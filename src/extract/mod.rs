@@ -406,6 +406,8 @@ fn annotation_type(r: &str) -> Option<String> {
         let t = r
             .trim_start_matches(['&', '*'])
             .trim_start_matches("mut ")
+            .trim_start_matches("dyn ")
+            .trim_start_matches("impl ")
             .trim_start();
         let t = if t.starts_with('\'') {
             t.split_once(' ').map(|x| x.1).unwrap_or("")
@@ -612,10 +614,20 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
         }
 
         if let Some(cnode) = call_node {
-            let to_name = source[cnode.start_byte()..cnode.end_byte()].to_string();
+            let mut to_name = source[cnode.start_byte()..cnode.end_byte()].to_string();
+            let mut qualifier = call_qualifier(cnode, source);
+            // Ruby `Repo.new` instantiates Repo.
+            if lang == Language::Ruby
+                && to_name == "new"
+                && qualifier
+                    .as_deref()
+                    .is_some_and(|q| q.starts_with(|c: char| c.is_ascii_uppercase()))
+            {
+                to_name = qualifier.take().expect("checked");
+            }
             sites.push(EdgeSite {
                 kind: EdgeKind::Calls,
-                qualifier: call_qualifier(cnode, source),
+                qualifier,
                 to_name,
                 node_start: cnode.start_byte(),
                 node_end: cnode.end_byte(),
@@ -768,7 +780,20 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
                 let t = type_cache
                     .entry((j, q.clone()))
                     .or_insert_with(|| {
-                        infer_receiver_type(&q, &source[defs[j].byte_start..defs[j].byte_end])
+                        // Innermost definition first, then its containers
+                        // (a method's class body declares its fields).
+                        let mut k = Some(j);
+                        for _ in 0..3 {
+                            let Some(cur) = k else { break };
+                            let d = &defs[cur];
+                            if let Some(t) =
+                                infer_receiver_type(&q, &source[d.byte_start..d.byte_end])
+                            {
+                                return Some(t);
+                            }
+                            k = enclosing(&defs, d.byte_start, d.byte_end, true);
+                        }
+                        None
                     })
                     .clone();
                 if let Some(t) = t {
