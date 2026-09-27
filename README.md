@@ -74,7 +74,9 @@ Space-separated terms; `key:value` are filters, bare words match name/signature:
 
 - `kind:function|method|struct|enum|trait|interface|class|module|type|constant|field`
 - `lang:rust|typescript|javascript|python|go`
-- `file:<substr>` · `name:<substr>` · `calls:<callee>` · `returns:<type-substr>`
+- `file:<substr>` · `name:<substr>` · `calls:<callee>` · `returns:<type-substr>` · `owner:<Type>` (alias `in:`)
+
+Symbol targets accept qualified names: `codescope callers Store::open`, `codescope refs store::open`.
 
 ```sh
 codescope search "kind:method lang:rust calls:spawn returns:Result"
@@ -125,14 +127,15 @@ repo → Walker (ignore-aware) → tree-sitter parsers → Symbol/edge extractio
 ```
 
 - **Parsing:** tree-sitter (robust error recovery, incremental).
-- **Resolution:** two-tier — fast tree-sitter name/scope heuristics now (labeled
-  `heuristic`), with a SCIP precision tier designed in (labeled `precise`).
+- **Resolution:** two-tier — fast tree-sitter heuristics now (labeled
+  `heuristic`: owner/receiver-aware, import-aware, local receiver-type
+  inference, abstains rather than guessing — ADR-0018), with a SCIP precision tier designed in (labeled `precise`).
 - **Storage:** embedded, single-file, memory-mapped redb. No external DB.
 - **Concurrency:** rayon for parallel parsing/extraction.
 
 ## Documentation
 
-- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (17 ADRs).
+- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (18 ADRs).
 - **Domain-Driven Design:** [`docs/ddd/`](docs/ddd/) — ubiquitous language,
   bounded contexts, domain model, services & repositories.
 - **Benchmarks & validation:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).

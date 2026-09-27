@@ -27,6 +27,9 @@ pub struct SymbolView {
     pub kind: &'static str,
     pub language: &'static str,
     pub signature: String,
+    /// Owning type/trait/class for methods.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub file: String,
     pub line_start: u32,
     pub line_end: u32,
@@ -39,6 +42,10 @@ pub struct SymbolView {
     /// Resolution confidence for edge-derived results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<&'static str>,
+    /// For edge-derived hits: how many other candidates tied when the edge
+    /// was heuristically bound (omitted when unambiguous).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ambiguity: Option<u16>,
 }
 
 impl SymbolView {
@@ -49,17 +56,25 @@ impl SymbolView {
             kind: s.kind.name(),
             language: s.language.name(),
             signature: s.signature.clone(),
+            owner: s.owner.clone(),
             file: s.file.clone(),
             line_start: s.span.line_start,
             line_end: s.span.line_end,
             depth: None,
             site_line: None,
             confidence: None,
+            ambiguity: None,
         }
     }
 
     pub(crate) fn est(&self) -> usize {
-        est_tokens(self.name.len() + self.signature.len() + self.file.len() + 64)
+        est_tokens(
+            self.name.len()
+                + self.signature.len()
+                + self.file.len()
+                + self.owner.as_ref().map_or(0, |o| o.len() + 10)
+                + 64,
+        )
     }
 }
 
@@ -178,6 +193,19 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// The segment before the last one: `Store` in `a::Store::open`.
+fn qualifier_of(target: &str) -> Option<&str> {
+    let (head, _) = target
+        .rsplit_once("::")
+        .or_else(|| target.rsplit_once('.'))?;
+    let q = head
+        .rsplit("::")
+        .next()
+        .and_then(|s| s.rsplit('.').next())
+        .unwrap_or(head);
+    (!q.is_empty()).then_some(q)
+}
+
 fn last_segment(target: &str) -> &str {
     target
         .rsplit("::")
@@ -198,6 +226,23 @@ pub(crate) fn resolve_targets(graph: &CodeGraph, target: &str) -> Vec<SymbolId> 
     // declaration (e.g. `parser` the module vs. `parser` the fn); prefer the
     // declarations and fall back to the module only if nothing else matches.
     let ids = graph.by_name(last_segment(target));
+    // `Owner::name` / `Owner.name` / `module::name`: narrow by owner or file
+    // module when the qualifier matches anything.
+    if let Some(q) = qualifier_of(target) {
+        let narrowed: Vec<SymbolId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                graph.symbol(*id).is_some_and(|s| {
+                    s.owner.as_deref() == Some(q)
+                        || s.file.rsplit('/').next().and_then(|f| f.split('.').next()) == Some(q)
+                })
+            })
+            .collect();
+        if !narrowed.is_empty() {
+            return narrowed;
+        }
+    }
     let decls: Vec<SymbolId> = ids
         .iter()
         .copied()
@@ -240,18 +285,19 @@ pub fn references(graph: &CodeGraph, name: &str, max_tokens: usize) -> QueryResu
     let mut budget = Budget::new(max_tokens);
     let targets: HashSet<SymbolId> = resolve_targets(graph, name).into_iter().collect();
     let empty = targets.is_empty();
-    let mut hits: Vec<(SymbolId, u32, &'static str)> = Vec::new();
+    let mut hits: Vec<(SymbolId, u32, &'static str, u16)> = Vec::new();
     for t in &targets {
-        for e in graph.in_edges(*t) {
-            hits.push((e.from, e.line, e.confidence.name()));
+        for e in graph.in_edges(*t).filter(|e| e.kind != EdgeKind::Contains) {
+            hits.push((e.from, e.line, e.confidence.name(), e.alternatives));
         }
     }
     hits.sort_by_key(|a| a.1);
-    for (from, line, conf) in hits {
+    for (from, line, conf, alts) in hits {
         if let Some(s) = graph.symbol(from) {
             let mut v = SymbolView::from_symbol(s);
             v.site_line = Some(line);
             v.confidence = Some(conf);
+            v.ambiguity = (alts > 0).then_some(alts);
             if !budget.push(v) {
                 break;
             }
@@ -368,7 +414,12 @@ pub fn blast_radius(graph: &CodeGraph, target: &str, max_tokens: usize) -> Query
     traverse(
         graph,
         &roots,
-        &[EdgeKind::Calls, EdgeKind::References, EdgeKind::Imports],
+        &[
+            EdgeKind::Calls,
+            EdgeKind::References,
+            EdgeKind::Imports,
+            EdgeKind::Defines,
+        ],
         true,
         u32::MAX,
         max_tokens,
@@ -482,7 +533,7 @@ fn detect_cycles(adj: &std::collections::HashMap<String, Vec<String>>) -> Vec<Ve
 ///
 /// Supports space-separated terms; `key:value` terms are filters, bare terms are
 /// substring matches against name+signature. Keys: `kind`, `lang`, `file`,
-/// `calls`, `returns`, `name`.
+/// `calls`, `returns`, `name`, `owner` (alias `in`).
 pub fn structural_search(graph: &CodeGraph, query: &str, max_tokens: usize) -> QueryResult {
     let mut budget = Budget::new(max_tokens);
     let filters = parse_query(query);
@@ -512,6 +563,7 @@ enum Filter {
     Calls(String),
     Returns(String),
     Name(String),
+    Owner(String),
     Text(String),
 }
 
@@ -523,6 +575,10 @@ impl Filter {
             Filter::File(f) => s.file.contains(f.as_str()),
             Filter::Name(n) => s.name.to_lowercase().contains(&n.to_lowercase()),
             Filter::Returns(t) => s.signature.contains(t.as_str()),
+            Filter::Owner(o) => s
+                .owner
+                .as_deref()
+                .is_some_and(|x| x.eq_ignore_ascii_case(o)),
             Filter::Text(t) => {
                 let t = t.to_lowercase();
                 s.name.to_lowercase().contains(&t) || s.signature.to_lowercase().contains(&t)
@@ -544,6 +600,7 @@ fn parse_query(query: &str) -> Vec<Filter> {
             Some(("calls", v)) => Filter::Calls(v.to_string()),
             Some(("returns", v)) => Filter::Returns(v.to_string()),
             Some(("name", v)) => Filter::Name(v.to_string()),
+            Some(("owner", v)) | Some(("in", v)) => Filter::Owner(v.to_string()),
             _ => Filter::Text(term.to_string()),
         })
         .collect()
@@ -559,7 +616,44 @@ pub struct RepoSummary {
     pub top_modules: Vec<ModuleSummary>,
     /// Most-referenced symbols (likely architectural hubs).
     pub key_symbols: Vec<SymbolView>,
+    /// Call-graph resolution quality (ADR-0018).
+    pub resolution: ResolutionStats,
     pub truncated: bool,
+}
+
+/// How well call sites bound to definitions.
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolutionStats {
+    pub call_sites: usize,
+    /// Bound to a definition inside the repo.
+    pub resolved: usize,
+    /// Bound, but other candidates tied.
+    pub ambiguous: usize,
+    /// Share of call sites resolved unambiguously (0–1).
+    pub unambiguous_rate: f32,
+}
+
+pub fn resolution_stats(graph: &CodeGraph) -> ResolutionStats {
+    let (mut call_sites, mut resolved, mut ambiguous) = (0, 0, 0);
+    for e in graph.edges().iter().filter(|e| e.kind == EdgeKind::Calls) {
+        call_sites += 1;
+        if e.to.is_some() {
+            resolved += 1;
+            if e.alternatives > 0 {
+                ambiguous += 1;
+            }
+        }
+    }
+    ResolutionStats {
+        call_sites,
+        resolved,
+        ambiguous,
+        unambiguous_rate: if call_sites == 0 {
+            1.0
+        } else {
+            (resolved - ambiguous) as f32 / call_sites as f32
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -619,6 +713,7 @@ pub fn repo_summary(graph: &CodeGraph, max_tokens: usize) -> RepoSummary {
         edge_count: graph.edge_count(),
         top_modules,
         key_symbols,
+        resolution: resolution_stats(graph),
         truncated,
     }
 }
@@ -627,6 +722,8 @@ pub fn repo_summary(graph: &CodeGraph, max_tokens: usize) -> RepoSummary {
 #[derive(Debug, Clone, Serialize)]
 pub struct MapSymbol {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub kind: &'static str,
     pub line: u32,
     pub signature: String,
@@ -716,6 +813,7 @@ pub fn repo_map(graph: &CodeGraph, focus: &[String], max_tokens: usize) -> RepoM
         }
         groups.entry(s.file.clone()).or_default().push(MapSymbol {
             name: s.name.clone(),
+            owner: s.owner.clone(),
             kind: s.kind.name(),
             line: s.span.line_start,
             signature: sig,
@@ -855,6 +953,34 @@ mod tests {
         assert_eq!(m.files[0].file, "y.rs");
         let m = repo_map(&g, &["x".to_string()], DEFAULT_MAX_TOKENS);
         assert_eq!(m.files[0].file, "x.rs");
+    }
+
+    #[test]
+    fn qualified_targets_and_owner_filter() {
+        let g = graph_from(&[
+            (
+                "a.rs",
+                "struct A;\nimpl A { fn go(&self) {} }\nfn use_a(a: A) { a.go(); }\n",
+            ),
+            ("b.rs", "struct B;\nimpl B { fn go(&self) {} }\n"),
+        ]);
+        let d = definition(&g, "B::go", DEFAULT_MAX_TOKENS);
+        assert_eq!(d.count, 1);
+        assert_eq!(d.results[0].owner.as_deref(), Some("B"));
+        assert_eq!(definition(&g, "go", DEFAULT_MAX_TOKENS).count, 2);
+        let r = structural_search(&g, "kind:method owner:a", DEFAULT_MAX_TOKENS);
+        assert_eq!(r.count, 1);
+        assert_eq!(r.results[0].file, "a.rs");
+    }
+
+    #[test]
+    fn blast_radius_follows_trait_impls() {
+        let g = graph_from(&[(
+            "a.rs",
+            "trait T { fn m(&self); }\nstruct S;\nimpl T for S { fn m(&self) {} }\n",
+        )]);
+        let br = blast_radius(&g, "T::m", DEFAULT_MAX_TOKENS);
+        assert!(br.results.iter().any(|v| v.owner.as_deref() == Some("S")));
     }
 
     #[test]

@@ -225,6 +225,14 @@ pub fn run(cli: Cli) -> Result<()> {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         );
+                        let r = &s.resolution;
+                        println!(
+                            "call resolution: {}/{} bound, {} ambiguous ({:.0}% unambiguous)",
+                            r.resolved,
+                            r.call_sites,
+                            r.ambiguous,
+                            r.unambiguous_rate * 100.0
+                        );
                         println!("\ntop modules:");
                         for m in &s.top_modules {
                             println!("  {:>4}  {}", m.symbols, m.file);
@@ -296,10 +304,18 @@ fn emit(result: QueryResult, json: bool) {
             .site_line
             .map(|l| format!(" @ line {l}"))
             .unwrap_or_default();
-        let conf = v.confidence.map(|c| format!(" ({c})")).unwrap_or_default();
+        let conf = match (v.confidence, v.ambiguity) {
+            (Some(c), Some(n)) => format!(" ({c}, {n} other candidate(s))"),
+            (Some(c), None) => format!(" ({c})"),
+            _ => String::new(),
+        };
+        let name = match &v.owner {
+            Some(o) => format!("{o}::{}", v.name),
+            None => v.name.clone(),
+        };
         println!(
-            "  {depth}{} {} — {}:{}-{}{site}{conf}",
-            v.kind, v.name, v.file, v.line_start, v.line_end
+            "  {depth}{} {name} — {}:{}-{}{site}{conf}",
+            v.kind, v.file, v.line_start, v.line_end
         );
     }
 }

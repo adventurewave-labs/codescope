@@ -21,3 +21,4 @@ This directory records the architecture decisions for `codescope`, written in th
 | [0015](0015-pagerank-repo-map.md) | PageRank Repo Map & Centrality | Accepted |
 | [0016](0016-diff-impact.md) | Diff-Driven Change Impact | Accepted |
 | [0017](0017-mcp-2025-06-18.md) | MCP 2025-06-18 Alignment | Accepted |
+| [0018](0018-receiver-aware-resolution.md) | Owner- and Receiver-Aware Resolution | Accepted |

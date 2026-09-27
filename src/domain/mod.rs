@@ -209,6 +209,13 @@ pub struct Edge {
     /// Resolved target symbol, if resolution succeeded.
     pub to: Option<SymbolId>,
     pub confidence: Confidence,
+    /// Receiver / path qualifier written at the use site, if any: `self`,
+    /// `Self`, `this`, a type (`Store` in `Store::open`), a module (`store` in
+    /// `store::open`), or a variable. Used as a resolution hint (ADR-0018).
+    pub qualifier: Option<String>,
+    /// How many *other* candidates tied with the chosen target during
+    /// heuristic resolution. `0` means the binding was unambiguous.
+    pub alternatives: u16,
     /// 1-based line of the use site. Edges don't need full byte ranges (only
     /// symbols do), so we keep just the line to shrink the on-disk/in-memory
     /// graph — edges dominate the graph by volume (ADR-0005, ADR-0006).
@@ -230,6 +237,19 @@ pub struct Symbol {
     /// The id of the lexically enclosing symbol, if any (e.g. the struct a
     /// method belongs to, or the module a function lives in).
     pub container: Option<SymbolId>,
+    /// For methods: the owning type/trait/class name (Rust `impl` target, Go
+    /// receiver type, Python/JS/TS class). `None` for free functions.
+    pub owner: Option<String>,
+}
+
+impl Symbol {
+    /// `Owner::name` for methods, plain `name` otherwise.
+    pub fn qualified_name(&self) -> String {
+        match &self.owner {
+            Some(o) => format!("{o}::{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 /// A source file's extracted contribution to the graph. Entity / per-file
@@ -439,6 +459,7 @@ mod tests {
                 byte_end: 10,
             },
             container: None,
+            owner: None,
         };
         g.upsert_file(SourceFile {
             path: "a.rs".into(),

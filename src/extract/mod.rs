@@ -78,6 +78,169 @@ struct DefRecord {
     span: Span,
     byte_start: usize,
     byte_end: usize,
+    /// Owner type discovered syntactically at capture time (Go receivers).
+    owner: Option<String>,
+}
+
+/// A Rust `impl [Trait for] Type { … }` block: not a symbol itself, but the
+/// scope that turns the functions inside into methods of `Type`.
+struct ImplScope {
+    byte_start: usize,
+    byte_end: usize,
+    ty: String,
+    trait_: Option<String>,
+}
+
+/// Reduce a type expression to its bare name: `crate::a::Store<T>` → `Store`,
+/// `*Server` → `Server`, `&'a mut Foo` → `Foo`.
+fn bare_type(text: &str) -> String {
+    let t = text.split(['<', '[', '(']).next().unwrap_or(text);
+    let t = t.rsplit("::").next().unwrap_or(t);
+    let t = t.rsplit('.').next().unwrap_or(t);
+    t.split_whitespace()
+        .last()
+        .unwrap_or("")
+        .trim_start_matches(['*', '&'])
+        .trim_start_matches("mut ")
+        .to_string()
+}
+
+/// Go: `(s *Server)` → `Server`.
+fn go_receiver_type(receiver: &str) -> Option<String> {
+    let inner = receiver
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    let ty = inner.split_whitespace().last()?;
+    let t = bare_type(ty);
+    (!t.is_empty()).then_some(t)
+}
+
+/// The receiver / path qualifier of a call site, from the callee node's parent:
+/// `self.foo()` → `self`, `Store::open()` → `Store`, `a.b.c()` → `b`.
+fn call_qualifier(callee: Node, source: &str) -> Option<String> {
+    let parent = callee.parent()?;
+    let field = match parent.kind() {
+        "field_expression" => "value",
+        "scoped_identifier" => "path",
+        "member_expression" => "object",
+        "attribute" => "object",
+        "selector_expression" => "operand",
+        _ => return None,
+    };
+    let q = parent.child_by_field_name(field)?;
+    let text = &source[q.start_byte()..q.end_byte()];
+    let last = text
+        .rsplit("::")
+        .next()
+        .and_then(|t| t.rsplit('.').next())
+        .unwrap_or(text)
+        .trim_end_matches(')')
+        .trim_end_matches('(');
+    let last = last.split('<').next().unwrap_or(last).trim();
+    (!last.is_empty()).then(|| last.to_string())
+}
+
+/// Lightweight local type inference for a call receiver (ADR-0018).
+///
+/// Scans the enclosing definition's text for the variable's declaration and
+/// returns its type name when it is evident syntactically:
+/// * annotations / params — `q: Type`, `q: &mut Type`, Go `(q *Type`, `, q Type`
+/// * constructors — `q = Type::new(…)`, `q = Type(…)`, `q = new Type(…)`,
+///   `q := &Type{…}`, Go `q := NewType(…)`
+///
+/// Only capitalized results are accepted (a type, not a variable/function).
+pub(crate) fn infer_receiver_type(q: &str, scope: &str) -> Option<String> {
+    let bytes = scope.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(off) = scope[from..].find(q) {
+        let i = from + off;
+        from = i + q.len();
+        let before_ok = i == 0 || !is_ident(bytes[i - 1]);
+        let end = i + q.len();
+        let after_ok = end >= bytes.len() || !is_ident(bytes[end]);
+        if !before_ok || !after_ok {
+            continue;
+        }
+        let rest = scope[end..].trim_start();
+        let prev = scope[..i].trim_end();
+        let candidate = if let Some(r) = rest.strip_prefix(":=") {
+            constructor_type(r)
+        } else if rest.starts_with("::") {
+            None
+        } else if let Some(r) = rest.strip_prefix(':') {
+            annotation_type(r)
+        } else if rest.starts_with("==") || rest.starts_with("=>") {
+            None
+        } else if let Some(r) = rest.strip_prefix('=') {
+            constructor_type(r)
+        } else if prev.ends_with('(') || prev.ends_with(',') {
+            // Go-style `(q *Type` / `, q Type` parameter.
+            annotation_type(rest)
+        } else {
+            None
+        };
+        if let Some(t) = candidate {
+            if t.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && t != "Self" {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+fn annotation_type(r: &str) -> Option<String> {
+    let mut r = r.trim_start();
+    loop {
+        let t = r
+            .trim_start_matches(['&', '*'])
+            .trim_start_matches("mut ")
+            .trim_start();
+        let t = if t.starts_with('\'') {
+            t.split_once(' ').map(|x| x.1).unwrap_or("")
+        } else {
+            t
+        };
+        if t.len() == r.len() {
+            break;
+        }
+        r = t;
+    }
+    let path: String = r
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':' || *c == '.')
+        .collect();
+    let last = path.rsplit("::").next()?.rsplit('.').next()?;
+    (!last.is_empty()).then(|| last.to_string())
+}
+
+fn constructor_type(r: &str) -> Option<String> {
+    let r = r.trim_start().trim_start_matches('&').trim_start();
+    let r = r.strip_prefix("new ").unwrap_or(r).trim_start();
+    let r = r.strip_prefix("await ").unwrap_or(r);
+    let path: String = r
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':' || *c == '.')
+        .collect();
+    let segs: Vec<&str> = path
+        .split("::")
+        .flat_map(|s| s.split('.'))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let last = *segs.last()?;
+    // `Type::new(` → Type; `Type(` / `Type{` → Type; Go `NewType(` → Type.
+    let ty = if last.chars().next()?.is_ascii_lowercase() && segs.len() >= 2 {
+        segs[segs.len() - 2]
+    } else if let Some(t) = last
+        .strip_prefix("New")
+        .filter(|t| t.starts_with(|c: char| c.is_ascii_uppercase()))
+    {
+        t
+    } else {
+        last
+    };
+    Some(ty.to_string())
 }
 
 fn span_of(node: Node) -> Span {
@@ -154,12 +317,14 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
     let mut defs: Vec<DefRecord> = Vec::new();
     struct EdgeSite {
         kind: EdgeKind,
+        qualifier: Option<String>,
         to_name: String,
         node_start: usize,
         node_end: usize,
         line: u32,
     }
     let mut sites: Vec<EdgeSite> = Vec::new();
+    let mut impls: Vec<ImplScope> = Vec::new();
 
     let cap_names = query.capture_names();
     let mut cursor = QueryCursor::new();
@@ -173,6 +338,22 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
         let mut import_node: Option<Node> = None;
         for cap in m.captures {
             let cname = cap_names[cap.index as usize];
+            if cname == "scope.impl" {
+                let n = cap.node;
+                if let Some(ty) = n.child_by_field_name("type") {
+                    let ty = bare_type(&source[ty.start_byte()..ty.end_byte()]);
+                    let trait_ = n
+                        .child_by_field_name("trait")
+                        .map(|t| bare_type(&source[t.start_byte()..t.end_byte()]));
+                    impls.push(ImplScope {
+                        byte_start: n.start_byte(),
+                        byte_end: n.end_byte(),
+                        ty,
+                        trait_,
+                    });
+                }
+                continue;
+            }
             if cname == "name" {
                 name_node = Some(cap.node);
             } else if let Some(k) = kind_for_capture(cname) {
@@ -193,15 +374,22 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
                 continue;
             }
             let span = span_of(dnode);
-            let id = SymbolId::compute(lang, rel_path, &name, kind, span.line_start);
+            let owner = if dnode.kind() == "method_declaration" {
+                dnode
+                    .child_by_field_name("receiver")
+                    .and_then(|r| go_receiver_type(&source[r.start_byte()..r.end_byte()]))
+            } else {
+                None
+            };
             defs.push(DefRecord {
-                id,
+                id: SymbolId(0), // assigned once the final kind is known
                 kind,
                 name,
                 signature: signature_of(dnode, source),
                 span,
                 byte_start: dnode.start_byte(),
                 byte_end: dnode.end_byte(),
+                owner,
             });
         }
 
@@ -209,6 +397,7 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
             let to_name = source[cnode.start_byte()..cnode.end_byte()].to_string();
             sites.push(EdgeSite {
                 kind: EdgeKind::Calls,
+                qualifier: call_qualifier(cnode, source),
                 to_name,
                 node_start: cnode.start_byte(),
                 node_end: cnode.end_byte(),
@@ -222,12 +411,55 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
                 .to_string();
             sites.push(EdgeSite {
                 kind: EdgeKind::Imports,
+                qualifier: None,
                 to_name,
                 node_start: inode.start_byte(),
                 node_end: inode.end_byte(),
                 line: inode.start_position().row as u32 + 1,
             });
         }
+    }
+
+    // ---- Classify methods and assign owners ----
+    // Functions inside a Rust `impl`, or lexically inside a class/struct/trait/
+    // interface, are methods of that owner (ADR-0018).
+    let mut trait_of: Vec<Option<String>> = vec![None; defs.len()];
+    for i in 0..defs.len() {
+        if !defs[i].kind.is_callable() {
+            continue;
+        }
+        let (bs, be) = (defs[i].byte_start, defs[i].byte_end);
+        let imp = impls
+            .iter()
+            .filter(|im| im.byte_start <= bs && im.byte_end >= be)
+            .min_by_key(|im| im.byte_end - im.byte_start);
+        let encl = enclosing(&defs, bs, be, true).filter(|&j| {
+            matches!(
+                defs[j].kind,
+                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Interface
+            )
+        });
+        // Innermost wins between an impl block and an enclosing type def.
+        let from_impl = match (imp, encl) {
+            (Some(im), Some(j)) => {
+                (im.byte_end - im.byte_start) < (defs[j].byte_end - defs[j].byte_start)
+            }
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if from_impl {
+            let im = imp.expect("checked");
+            defs[i].owner = Some(im.ty.clone());
+            trait_of[i] = im.trait_.clone();
+        } else if let Some(j) = encl {
+            defs[i].owner = Some(defs[j].name.clone());
+        }
+        if defs[i].owner.is_some() {
+            defs[i].kind = SymbolKind::Method;
+        }
+    }
+    for d in defs.iter_mut() {
+        d.id = SymbolId::compute(lang, rel_path, &d.name, d.kind, d.span.line_start);
     }
 
     // ---- Build symbols with containers ----
@@ -243,12 +475,29 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
         file: rel_path.to_string(),
         span: file_span,
         container: None,
+        owner: None,
     });
 
     let mut edges: Vec<Edge> = Vec::new();
     for (i, d) in defs.iter().enumerate() {
+        // Impl methods hang off their type when it is declared in this file.
+        let owner_def = d.owner.as_ref().and_then(|o| {
+            defs.iter().find(|t| {
+                &t.name == o
+                    && matches!(
+                        t.kind,
+                        SymbolKind::Struct
+                            | SymbolKind::Enum
+                            | SymbolKind::Trait
+                            | SymbolKind::Class
+                            | SymbolKind::Interface
+                            | SymbolKind::Type
+                    )
+            })
+        });
         let container = enclosing(&defs, d.byte_start, d.byte_end, true)
             .map(|j| defs[j].id)
+            .or(owner_def.map(|t| t.id))
             .unwrap_or(module_id);
         symbols.push(Symbol {
             id: d.id,
@@ -259,6 +508,7 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
             file: rel_path.to_string(),
             span: d.span,
             container: Some(container),
+            owner: d.owner.clone(),
         });
         // Contains edge from container to this symbol.
         edges.push(Edge {
@@ -267,22 +517,53 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
             to_name: d.name.clone(),
             to: Some(d.id),
             confidence: Confidence::Precise,
+            qualifier: None,
+            alternatives: 0,
             line: d.span.line_start,
         });
-        let _ = i;
+        // `impl Trait for Type { fn m() }` → m Defines Trait::m.
+        if let Some(tr) = &trait_of[i] {
+            edges.push(Edge {
+                kind: EdgeKind::Defines,
+                from: d.id,
+                to_name: format!("{tr}::{}", d.name),
+                to: None,
+                confidence: Confidence::Heuristic,
+                qualifier: Some(tr.clone()),
+                alternatives: 0,
+                line: d.span.line_start,
+            });
+        }
     }
 
     // ---- Attribute edge sites to their enclosing definition ----
-    for site in sites {
-        let from = enclosing(&defs, site.node_start, site.node_end, false)
-            .map(|j| defs[j].id)
-            .unwrap_or(module_id);
+    let mut type_cache: HashMap<(usize, String), Option<String>> = HashMap::new();
+    for mut site in sites {
+        let encl = enclosing(&defs, site.node_start, site.node_end, false);
+        let from = encl.map(|j| defs[j].id).unwrap_or(module_id);
+        // Replace a variable receiver with its inferred type when evident.
+        if let (Some(j), Some(q)) = (encl, site.qualifier.clone()) {
+            let lower = q.starts_with(|c: char| c.is_ascii_lowercase() || c == '_');
+            if lower && !matches!(q.as_str(), "self" | "this" | "cls" | "super") {
+                let t = type_cache
+                    .entry((j, q.clone()))
+                    .or_insert_with(|| {
+                        infer_receiver_type(&q, &source[defs[j].byte_start..defs[j].byte_end])
+                    })
+                    .clone();
+                if let Some(t) = t {
+                    site.qualifier = Some(t);
+                }
+            }
+        }
         edges.push(Edge {
             kind: site.kind,
             from,
             to_name: site.to_name,
             to: None,
             confidence: Confidence::Heuristic,
+            qualifier: site.qualifier,
+            alternatives: 0,
             line: site.line,
         });
     }
@@ -325,6 +606,38 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.kind == EdgeKind::Calls && e.to_name == "bar"));
+    }
+
+    #[test]
+    fn infers_receiver_types() {
+        let t = |q: &str, src: &str| infer_receiver_type(q, src);
+        assert_eq!(
+            t("store", "fn f(store: &mut Store) {}").as_deref(),
+            Some("Store")
+        );
+        assert_eq!(
+            t("g", "fn f(g: &'a CodeGraph) {}").as_deref(),
+            Some("CodeGraph")
+        );
+        assert_eq!(
+            t("b", "let mut b = Budget::new(5);").as_deref(),
+            Some("Budget")
+        );
+        assert_eq!(t("r", "r = Repo(path)").as_deref(), Some("Repo"));
+        assert_eq!(
+            t("c", "const c = new Client({});").as_deref(),
+            Some("Client")
+        );
+        assert_eq!(t("s", "s := &Server{}").as_deref(), Some("Server"));
+        assert_eq!(t("s", "s := NewServer(cfg)").as_deref(), Some("Server"));
+        assert_eq!(
+            t("s", "func (s *Server) Start() {}").as_deref(),
+            Some("Server")
+        );
+        assert_eq!(t("v", "let v = Vec::new();").as_deref(), Some("Vec"));
+        assert_eq!(t("x", "if x == y {}"), None);
+        assert_eq!(t("n", "let n = compute();"), None);
+        assert_eq!(t("items", "items.push(1)"), None);
     }
 
     #[test]

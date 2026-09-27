@@ -18,6 +18,18 @@ const FILES: TableDefinition<&str, &[u8]> = TableDefinition::new("files");
 const HASHES: TableDefinition<&str, u64> = TableDefinition::new("hashes");
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
+/// On-disk record format version. Bump whenever `SourceFile`/`Symbol`/`Edge`
+/// change shape: a mismatched index is discarded and rebuilt on next index
+/// rather than failing to decode (ADR-0005).
+pub const SCHEMA_VERSION: &str = "2";
+
+/// Full index-compatibility key: record schema + crate version, so upgrading
+/// codescope (whose extraction/resolution rules may have changed) re-extracts
+/// even files whose content hash is unchanged.
+fn schema_key() -> String {
+    format!("{SCHEMA_VERSION}+{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Serialize + LZ4-compress a file record for on-disk storage.
 fn encode(file: &SourceFile) -> Result<Vec<u8>, StoreError> {
     let raw = bincode::serialize(file)?;
@@ -82,12 +94,23 @@ impl Store {
             let _ = std::fs::create_dir_all(parent);
         }
         let db = Database::create(path)?;
-        // Ensure tables exist so reads on a fresh db don't error.
+        // Ensure tables exist so reads on a fresh db don't error, and drop
+        // records written by an incompatible schema version.
         let wtxn = db.begin_write()?;
         {
+            let mut meta = wtxn.open_table(META)?;
+            let current = meta
+                .get("schema")?
+                .map(|v| String::from_utf8_lossy(v.value()).into_owned());
+            let key = schema_key();
+            if current.as_deref() != Some(key.as_str()) {
+                meta.insert("schema", key.as_bytes())?;
+                drop(meta);
+                wtxn.delete_table(FILES)?;
+                wtxn.delete_table(HASHES)?;
+            }
             wtxn.open_table(FILES)?;
             wtxn.open_table(HASHES)?;
-            wtxn.open_table(META)?;
         }
         wtxn.commit()?;
         Ok(Store { db })
@@ -216,6 +239,30 @@ mod tests {
         assert_eq!(hashes.get("a.rs"), Some(&7));
         let g = store.load_graph().unwrap();
         assert!(g.symbols().any(|s| s.name == "foo"));
+    }
+
+    #[test]
+    fn schema_mismatch_resets_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.redb");
+        {
+            let store = Store::open(&path).unwrap();
+            store
+                .put_file(&extract(Language::Rust, "a.rs", "fn foo() {}\n", 1))
+                .unwrap();
+            store.set_meta("schema", "0-old").unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.file_count().unwrap(),
+            0,
+            "stale-schema records dropped"
+        );
+        assert_eq!(
+            store.get_meta("schema").unwrap().as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+        assert!(store.file_hashes().unwrap().is_empty());
     }
 
     #[test]

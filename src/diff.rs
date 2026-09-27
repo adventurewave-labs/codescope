@@ -248,7 +248,12 @@ pub fn diff_impact(
     }
 
     // 2. Transitive dependents.
-    let kinds = [EdgeKind::Calls, EdgeKind::References, EdgeKind::Imports];
+    let kinds = [
+        EdgeKind::Calls,
+        EdgeKind::References,
+        EdgeKind::Imports,
+        EdgeKind::Defines,
+    ];
     let reached = reach(graph, &changed, &kinds, true, u32::MAX);
 
     // 3. Split into tests vs. production code.
