@@ -258,10 +258,7 @@ mod tests {
             0,
             "stale-schema records dropped"
         );
-        assert_eq!(
-            store.get_meta("schema").unwrap().as_deref(),
-            Some(SCHEMA_VERSION)
-        );
+        assert_eq!(store.get_meta("schema").unwrap(), Some(schema_key()));
         assert!(store.file_hashes().unwrap().is_empty());
     }
 
