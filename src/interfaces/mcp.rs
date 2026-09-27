@@ -25,11 +25,17 @@ fn negotiate(requested: Option<&str>) -> &'static str {
 struct Server {
     root: PathBuf,
     live: Option<LiveGraph>,
+    /// BM25F index cached per graph generation (ADR-0021).
+    search: Option<(u64, crate::search::SearchIndex)>,
 }
 
 impl Server {
     fn new(root: PathBuf) -> Self {
-        Server { root, live: None }
+        Server {
+            root,
+            live: None,
+            search: None,
+        }
     }
 
     /// The live graph, opened (and built, if no index exists) on first use,
@@ -111,7 +117,7 @@ fn handle(server: &mut Server, req: &Value) -> Option<Value> {
                     "title": "codescope code intelligence",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Structural code graph of this repository. Start with cs_repo_map (optionally with focus = the files/symbols you are editing) to orient; use cs_callers / cs_blast_radius before changing a symbol; run cs_diff_impact after editing to see what you affected and which tests to run. All answers are token-budgeted via max_tokens."
+                "instructions": "Structural code graph of this repository. Start with cs_repo_map (optionally with focus = the files/symbols you are editing) to orient; use cs_find to locate code by what it does; use cs_callers / cs_blast_radius before changing a symbol; run cs_diff_impact after editing to see what you affected and which tests to run. All answers are token-budgeted via max_tokens."
             }))
         }
         "tools/list" => Ok(json!({ "tools": tool_specs() })),
@@ -183,6 +189,20 @@ fn call_tool(server: &mut Server, params: &Value) -> std::result::Result<Value, 
         None
     };
 
+    if name == "cs_find" {
+        str_arg("query").ok_or((-32602, "missing 'query'".into()))?;
+        server
+            .graph()
+            .map_err(|e| (-32000, format!("index unavailable: {e}")))?;
+        let generation = server.live.as_ref().map_or(0, |l| l.generation());
+        if server.search.as_ref().map(|(g, _)| *g) != Some(generation) {
+            let idx =
+                crate::search::SearchIndex::build(server.live.as_ref().expect("open").graph());
+            server.search = Some((generation, idx));
+        }
+    }
+
+    let search = server.search.take();
     let (graph, freshness) = server
         .graph()
         .map_err(|e| (-32000, format!("index unavailable: {e}")))?;
@@ -225,6 +245,11 @@ fn call_tool(server: &mut Server, params: &Value) -> std::result::Result<Value, 
             let q = str_arg("query").ok_or((-32602, "missing 'query'".into()))?;
             serde_json::to_value(query::structural_search(graph, &q, max_tokens)).unwrap()
         }
+        "cs_find" => {
+            let q = str_arg("query").unwrap_or_default();
+            let (_, idx) = search.as_ref().expect("built above");
+            serde_json::to_value(crate::search::find(graph, idx, &q, max_tokens)).unwrap()
+        }
         "cs_repo_summary" => serde_json::to_value(query::repo_summary(graph, max_tokens)).unwrap(),
         "cs_repo_map" => {
             let focus: Vec<String> = match args.get("focus") {
@@ -240,6 +265,7 @@ fn call_tool(server: &mut Server, params: &Value) -> std::result::Result<Value, 
         other => return Err((-32602, format!("unknown tool: {other}"))),
     };
 
+    server.search = search;
     if let Value::Object(map) = &mut payload {
         map.insert("freshness".into(), serde_json::to_value(freshness).unwrap());
     }
@@ -348,6 +374,11 @@ fn base_specs() -> Vec<Value> {
             "inputSchema": { "type": "object", "properties": { "max_tokens": { "type": "integer" } } }
         }),
         json!({
+            "name": "cs_find",
+            "description": "Find code by what it does, in plain language (e.g. 'where do we retry failed uploads', 'parse config file'). Hybrid ranking: BM25 over identifier subtokens, signatures, doc comments and paths, fused with PageRank centrality. Structural filters (kind:, lang:, file:, owner:) may be mixed in. Use when you don't know a symbol's name; use cs_definition when you do.",
+            "inputSchema": sym_schema("query", "Natural-language description, optionally with kind:/lang:/file:/owner: filters.")
+        }),
+        json!({
             "name": "cs_repo_map",
             "description": "PageRank-ranked map of the repo's most important signatures, grouped by file, within the token budget. Pass `focus` (files or symbols you are working on) to personalize the ranking to what matters around them. Best first call when orienting.",
             "inputSchema": {
@@ -391,7 +422,7 @@ mod tests {
         let list = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
         let resp = handle(&mut server, &list).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         assert!(tools
             .iter()
             .all(|t| t["annotations"]["readOnlyHint"].is_boolean()));
@@ -422,6 +453,14 @@ mod tests {
         let sc = &resp["result"]["structuredContent"];
         assert_eq!(sc["results"][0]["name"], "a");
         assert!(resp["result"]["content"][0]["text"].is_string());
+
+        let find = json!({"jsonrpc":"2.0","id":7,"method":"tools/call",
+            "params":{"name":"cs_find","arguments":{"query":"hub"}}});
+        let resp = handle(&mut server, &find).unwrap();
+        assert_eq!(
+            resp["result"]["structuredContent"]["results"][0]["name"],
+            "hub"
+        );
 
         let map = json!({"jsonrpc":"2.0","id":4,"method":"tools/call",
             "params":{"name":"cs_repo_map","arguments":{"focus":["a"]}}});

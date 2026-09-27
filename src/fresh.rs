@@ -107,6 +107,7 @@ pub struct LiveGraph {
     known: HashSet<String>,
     indexed_at: SystemTime,
     last_check: Option<Instant>,
+    generation: u64,
     /// Minimum time between staleness checks (default 250 ms).
     pub check_interval: Duration,
 }
@@ -133,12 +134,19 @@ impl LiveGraph {
             known,
             indexed_at,
             last_check: fresh_build.then(Instant::now),
+            generation: 0,
             check_interval: Duration::from_millis(250),
         })
     }
 
     pub fn graph(&self) -> &CodeGraph {
         &self.graph
+    }
+
+    /// Increments whenever the graph's contents change (cache key for derived
+    /// structures such as the search index).
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn root(&self) -> &Path {
@@ -180,6 +188,7 @@ impl LiveGraph {
         };
         if mode != RefreshMode::Noop {
             self.known = self.graph.files().into_iter().collect();
+            self.generation += 1;
         }
         Ok(Refresh {
             mode,

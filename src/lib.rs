@@ -12,6 +12,7 @@
 //! * [`query`] — agent-facing query application services.
 //! * [`rank`] — PageRank centrality for repo maps and summaries.
 //! * [`diff`] — git-diff change-impact analysis.
+//! * [`search`] — hybrid BM25F + PageRank natural-language symbol search.
 //! * [`fresh`] — staleness checks + incremental in-memory patching.
 //! * [`watch`] — file-watcher driven re-indexing.
 //! * [`interfaces`] — CLI / JSON / MCP surfaces.
@@ -26,6 +27,7 @@ pub mod parser;
 pub mod query;
 pub mod rank;
 pub mod resolve;
+pub mod search;
 pub mod store;
 pub mod walker;
 pub mod watch;

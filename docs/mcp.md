@@ -51,6 +51,7 @@ the index is stale or absent.
 | `cs_dependency_graph` | — | `max_tokens` | File/module import graph with cycle detection. |
 | `cs_structural_search` | `query` | `max_tokens` | Structural matches (see query syntax below). |
 | `cs_repo_summary` | — | `max_tokens` | Token-bounded architectural overview to read before editing. |
+| `cs_find` | `query` | `max_tokens` | Natural-language search: BM25F over identifier subtokens, signatures, doc comments and paths, fused with PageRank (RRF); structural filters can be mixed in (ADR-0021). |
 | `cs_repo_map` | — | `focus[]`, `max_tokens` | PageRank-ranked signatures grouped by file; `focus` personalizes the ranking (ADR-0015). |
 | `cs_diff_impact` | — | `base`, `diff`, `max_tokens` | Changed symbols, transitive dependents and tests to run for the working tree vs. `base` or a supplied diff (ADR-0016). |
 

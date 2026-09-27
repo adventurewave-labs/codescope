@@ -105,6 +105,139 @@ struct DefRecord {
     byte_end: usize,
     /// Owner type discovered syntactically at capture time (Go receivers).
     owner: Option<String>,
+    doc: Option<String>,
+}
+
+fn is_comment(kind: &str) -> bool {
+    kind.contains("comment")
+}
+
+/// Strip comment markers and collapse whitespace.
+fn clean_doc(raw: &str) -> String {
+    let mut out = String::new();
+    for line in raw.lines() {
+        let l = line.trim();
+        let l = l
+            .trim_start_matches("/**")
+            .trim_start_matches("/*!")
+            .trim_start_matches("/*")
+            .trim_end_matches("*/")
+            .trim_start_matches("///")
+            .trim_start_matches("//!")
+            .trim_start_matches("//")
+            .trim_start_matches('*')
+            .trim_start_matches('#')
+            .trim_matches('"')
+            .trim_matches('\'')
+            .trim();
+        // Drop doc-tool noise lines (`@param`, `<summary>` tags).
+        let l = l
+            .trim_start_matches("<summary>")
+            .trim_end_matches("</summary>")
+            .trim();
+        if l.is_empty() || l.starts_with("@") && l.len() < 3 {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(l);
+    }
+    let out: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if out.chars().count() > crate::domain::DOC_MAX_CHARS {
+        let mut t: String = out.chars().take(crate::domain::DOC_MAX_CHARS - 1).collect();
+        t.push('…');
+        t
+    } else {
+        out
+    }
+}
+
+/// File-level documentation: Rust `//!` / `/*!` inner docs, a Python module
+/// docstring, or the comment block before a Go `package` clause.
+fn module_doc(root: Node, source: &str, lang: Language) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        let text = &source[child.start_byte()..child.end_byte()];
+        match (lang, child.kind()) {
+            (Language::Rust, k) if is_comment(k) => {
+                if text.starts_with("//!") || text.starts_with("/*!") {
+                    parts.push(text);
+                } else if !parts.is_empty() {
+                    break;
+                }
+            }
+            (Language::Python, "expression_statement") if parts.is_empty() => {
+                if let Some(st) = child.named_child(0).filter(|n| n.kind() == "string") {
+                    parts.push(&source[st.start_byte()..st.end_byte()]);
+                }
+                break;
+            }
+            (Language::Go, k) if is_comment(k) => parts.push(text),
+            (Language::Go, "package_clause") => break,
+            (_, k) if is_comment(k) && lang != Language::Python => {}
+            _ => break,
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let d = clean_doc(&parts.join("\n"));
+    (!d.is_empty()).then_some(d)
+}
+
+/// The leading doc comment of a definition: contiguous comment siblings just
+/// above it (skipping Rust attributes / decorators), or a Python docstring.
+fn doc_of(def: Node, source: &str, lang: Language) -> Option<String> {
+    // Python docstring: first statement of the body is a string literal.
+    if lang == Language::Python {
+        if let Some(body) = def.child_by_field_name("body") {
+            if let Some(first) = body.named_child(0) {
+                if first.kind() == "expression_statement" {
+                    if let Some(st) = first.named_child(0).filter(|n| n.kind() == "string") {
+                        let d = clean_doc(&source[st.start_byte()..st.end_byte()]);
+                        return (!d.is_empty()).then_some(d);
+                    }
+                }
+            }
+        }
+    }
+    // Comments attach to the outermost wrapper (export / decorated / template).
+    let mut anchor = def;
+    while let Some(p) = anchor.parent() {
+        if matches!(
+            p.kind(),
+            "export_statement" | "decorated_definition" | "template_declaration"
+        ) {
+            anchor = p;
+        } else {
+            break;
+        }
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    let mut cur = anchor;
+    let mut expect_row = anchor.start_position().row;
+    while let Some(prev) = cur.prev_sibling() {
+        let kind = prev.kind();
+        if kind == "attribute_item" || kind == "decorator" || kind == "annotation" {
+            expect_row = prev.start_position().row;
+            cur = prev;
+            continue;
+        }
+        if !is_comment(kind) || prev.end_position().row + 1 < expect_row {
+            break;
+        }
+        parts.push(&source[prev.start_byte()..prev.end_byte()]);
+        expect_row = prev.start_position().row;
+        cur = prev;
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.reverse();
+    let d = clean_doc(&parts.join("\n"));
+    (!d.is_empty()).then_some(d)
 }
 
 /// A Rust `impl [Trait for] Type { … }` block: not a symbol itself, but the
@@ -474,6 +607,7 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
                 byte_start: dnode.start_byte(),
                 byte_end: dnode.end_byte(),
                 owner,
+                doc: doc_of(dnode, source, lang),
             });
         }
 
@@ -560,6 +694,7 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
         span: file_span,
         container: None,
         owner: None,
+        doc: module_doc(root, source, lang),
     });
 
     let mut edges: Vec<Edge> = Vec::new();
@@ -593,6 +728,7 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
             span: d.span,
             container: Some(container),
             owner: d.owner.clone(),
+            doc: d.doc.clone(),
         });
         // Contains edge from container to this symbol.
         edges.push(Edge {
@@ -866,6 +1002,83 @@ mod tests {
         assert_eq!(call(&f, "items"), Some(None), "paren-less statement call");
         assert_eq!(call(&f, "save"), Some(Some("Repo".into())));
         assert_eq!(imports(&f), vec!["json", "store/repo"]);
+    }
+
+    #[test]
+    fn extracts_doc_comments() {
+        let rs = "/// Parse a unified diff.\n/// Returns ranges.\n#[inline]\npub fn parse() {}\n\n// unrelated\n\nfn bare() {}\n";
+        let f = extract(Language::Rust, "a.rs", rs, 0);
+        assert_eq!(
+            by_name(&f, "parse").doc.as_deref(),
+            Some("Parse a unified diff. Returns ranges.")
+        );
+        assert_eq!(
+            by_name(&f, "bare").doc,
+            None,
+            "blank line breaks attachment"
+        );
+
+        let py = "def f():\n    \"\"\"Compute the blast radius.\"\"\"\n    pass\n";
+        let f = extract(Language::Python, "a.py", py, 0);
+        assert_eq!(
+            by_name(&f, "f").doc.as_deref(),
+            Some("Compute the blast radius.")
+        );
+
+        let ts = "/**\n * Load the user profile.\n */\nexport function load() {}\n";
+        let f = extract(Language::TypeScript, "a.ts", ts, 0);
+        assert_eq!(
+            by_name(&f, "load").doc.as_deref(),
+            Some("Load the user profile.")
+        );
+
+        let go = "package p\n// Start begins serving.\nfunc Start() {}\n";
+        let f = extract(Language::Go, "a.go", go, 0);
+        assert_eq!(
+            by_name(&f, "Start").doc.as_deref(),
+            Some("Start begins serving.")
+        );
+
+        let java =
+            "class A {\n  /** Saves the order. */\n  @Override\n  public void save() {}\n}\n";
+        let f = extract(Language::Java, "A.java", java, 0);
+        assert_eq!(by_name(&f, "save").doc.as_deref(), Some("Saves the order."));
+    }
+
+    #[test]
+    fn extracts_module_docs() {
+        let f = extract(
+            Language::Rust,
+            "a.rs",
+            "//! Change-impact analysis.\n//! Second line.\n\nfn x() {}\n",
+            0,
+        );
+        let m = f.symbols.iter().find(|s| s.container.is_none()).unwrap();
+        assert_eq!(
+            m.doc.as_deref(),
+            Some("Change-impact analysis. Second line.")
+        );
+        let f = extract(
+            Language::Python,
+            "a.py",
+            "\"\"\"Billing helpers.\"\"\"\nimport os\n",
+            0,
+        );
+        let m = f.symbols.iter().find(|s| s.container.is_none()).unwrap();
+        assert_eq!(m.doc.as_deref(), Some("Billing helpers."));
+        let f = extract(
+            Language::Rust,
+            "b.rs",
+            "/// item doc, not module doc\nfn y() {}\n",
+            0,
+        );
+        assert!(f
+            .symbols
+            .iter()
+            .find(|s| s.container.is_none())
+            .unwrap()
+            .doc
+            .is_none());
     }
 
     #[test]

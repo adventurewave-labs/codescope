@@ -102,3 +102,9 @@ Release build, 4-core container, `cargo run --release --example fresh_latency --
 | dotnet/samples (C#) | 3,166 | 129k | 674 ms | 318 ms | 46 ms | 213 ms |
 
 "Before" = pre-ADR-0020 resolver (per-candidate import re-splitting, edge cloning).
+
+## `find` relevance (ADR-0021)
+
+`cargo test --test find_relevance -- --nocapture` — 16 behavior-phrased queries over codescope's own source:
+**MRR 0.693 · R@1 0.56 · R@5 0.88** (baseline BM25F+RRF before file-docs/test-downweight: 0.644 / 0.56 / 0.75).
+CLI `find` end-to-end: 115 ms (gson, 4.5k symbols), 690 ms (dotnet/samples, 25k symbols).

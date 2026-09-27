@@ -275,7 +275,13 @@ pub struct Symbol {
     /// For methods: the owning type/trait/class name (Rust `impl` target, Go
     /// receiver type, Python/JS/TS class). `None` for free functions.
     pub owner: Option<String>,
+    /// Leading doc comment / docstring, markers stripped, whitespace
+    /// collapsed, capped at [`DOC_MAX_CHARS`] (ADR-0021).
+    pub doc: Option<String>,
 }
+
+/// Maximum stored doc-comment length per symbol.
+pub const DOC_MAX_CHARS: usize = 320;
 
 impl Symbol {
     /// `Owner::name` for methods, plain `name` otherwise.
@@ -522,6 +528,7 @@ mod tests {
                     },
                     container: None,
                     owner: None,
+                    doc: None,
                 }],
                 edges: vec![],
             });
@@ -554,6 +561,7 @@ mod tests {
             },
             container: None,
             owner: None,
+            doc: None,
         };
         g.upsert_file(SourceFile {
             path: "a.rs".into(),

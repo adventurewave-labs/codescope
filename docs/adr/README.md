@@ -24,3 +24,4 @@ This directory records the architecture decisions for `codescope`, written in th
 | [0018](0018-receiver-aware-resolution.md) | Owner- and Receiver-Aware Resolution | Accepted |
 | [0019](0019-java-c-cpp-csharp-ruby.md) | Java, C, C++, C#, Ruby | Accepted |
 | [0020](0020-freshness.md) | Freshness: Auto-Refresh, Incremental Patching, Watch | Accepted |
+| [0021](0021-hybrid-search.md) | Hybrid Natural-Language Symbol Search | Accepted |
