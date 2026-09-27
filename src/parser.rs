@@ -15,6 +15,11 @@ pub fn ts_language(lang: Language) -> tree_sitter::Language {
         Language::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         Language::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::C => tree_sitter_c::LANGUAGE.into(),
+        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Language::Ruby => tree_sitter_ruby::LANGUAGE.into(),
     }
 }
 
@@ -38,6 +43,10 @@ mod tests {
         assert!(parse(Language::JavaScript, "function f() {}").is_some());
         assert!(parse(Language::TypeScript, "function f(): void {}").is_some());
         assert!(parse(Language::Go, "package main\nfunc main() {}").is_some());
+        for lang in Language::ALL {
+            let tree = parse(lang, "").expect("grammar loads");
+            assert_eq!(tree.root_node().child_count(), 0, "{lang}");
+        }
     }
 
     #[test]

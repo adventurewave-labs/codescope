@@ -18,6 +18,27 @@ pub enum Language {
     JavaScript,
     Python,
     Go,
+    Java,
+    C,
+    Cpp,
+    CSharp,
+    Ruby,
+}
+
+impl Language {
+    /// Every supported language (stable order).
+    pub const ALL: [Language; 10] = [
+        Language::Rust,
+        Language::TypeScript,
+        Language::JavaScript,
+        Language::Python,
+        Language::Go,
+        Language::Java,
+        Language::C,
+        Language::Cpp,
+        Language::CSharp,
+        Language::Ruby,
+    ];
 }
 
 impl Language {
@@ -31,6 +52,15 @@ impl Language {
             "js" | "jsx" | "mjs" | "cjs" => Language::JavaScript,
             "py" | "pyi" => Language::Python,
             "go" => Language::Go,
+            "java" => Language::Java,
+            "c" => Language::C,
+            // `.h` is parsed as C++: the C++ grammar accepts (nearly all) C
+            // headers, the reverse is not true (ADR-0019).
+            "h" | "cc" | "cpp" | "cxx" | "c++" | "hh" | "hpp" | "hxx" | "h++" | "ipp" => {
+                Language::Cpp
+            }
+            "cs" => Language::CSharp,
+            "rb" | "rake" => Language::Ruby,
             _ => return None,
         })
     }
@@ -42,6 +72,11 @@ impl Language {
             Language::JavaScript => "javascript",
             Language::Python => "python",
             Language::Go => "go",
+            Language::Java => "java",
+            Language::C => "c",
+            Language::Cpp => "cpp",
+            Language::CSharp => "csharp",
+            Language::Ruby => "ruby",
         }
     }
 }

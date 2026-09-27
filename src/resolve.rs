@@ -11,7 +11,7 @@
 //! Tier 2 (SCIP ingestion for compiler-accurate, `Precise` edges) is future
 //! work; the data model already carries [`Confidence`] so it can slot in.
 
-use crate::domain::{CodeGraph, Confidence, Edge, EdgeKind, SymbolId, SymbolKind};
+use crate::domain::{CodeGraph, Confidence, Edge, EdgeKind, Language, SymbolId, SymbolKind};
 use std::collections::HashMap;
 
 /// What the resolver needs to know about a candidate target.
@@ -30,6 +30,16 @@ struct Cand {
 struct Caller<'a> {
     file: &'a str,
     owner: Option<&'a str>,
+    language: Language,
+}
+
+/// Languages where a bare `f()` inside a method may be an implicit
+/// `this.f()` / `self.f()` call (ADR-0019).
+fn implicit_receiver(lang: Language) -> bool {
+    matches!(
+        lang,
+        Language::Java | Language::CSharp | Language::Cpp | Language::Ruby
+    )
 }
 
 fn stem_and_dir(path: &str) -> (String, String) {
@@ -94,6 +104,7 @@ pub fn resolve(graph: &mut CodeGraph) {
             let caller = Caller {
                 file: &src.file,
                 owner: src.owner.as_deref(),
+                language: src.language,
             };
             let file_imports = imports
                 .get(src.file.as_str())
@@ -160,6 +171,7 @@ fn resolve_one(
 
     let mut best: Option<(SymbolId, u32)> = None;
     let mut ties: u16 = 0;
+    let mut best_key: Option<(Option<&str>, &str)> = None;
     for c in candidates {
         if c.id == edge.from {
             continue; // never self-resolve
@@ -185,7 +197,12 @@ fn resolve_one(
                 }
             }
             None => {
-                if c.owner.is_none() {
+                if implicit_receiver(caller.language)
+                    && c.owner.is_some()
+                    && c.owner.as_deref() == caller.owner
+                {
+                    score += 16; // implicit this/self
+                } else if c.owner.is_none() {
                     score += 2;
                 }
             }
@@ -200,9 +217,16 @@ fn resolve_one(
             .unwrap_or(0);
         match best {
             Some((_, b)) if b > score => {}
-            Some((_, b)) if b == score => ties += 1,
+            Some((_, b)) if b == score => {
+                // Overloads (same owner, same file) are one logical method —
+                // not real ambiguity (Java/C#/C++ overload sets).
+                if best_key != Some((c.owner.as_deref(), c.file.as_str())) {
+                    ties += 1;
+                }
+            }
             _ => {
                 best = Some((c.id, score));
+                best_key = Some((c.owner.as_deref(), c.file.as_str()));
                 ties = 0;
             }
         }
@@ -393,6 +417,44 @@ mod tests {
             target_of(&g, "fill", "push").unwrap().owner.as_deref(),
             Some("Budget")
         );
+    }
+
+    #[test]
+    fn implicit_receiver_prefers_own_class() {
+        let g = graph(&[
+            (
+                "a.rb",
+                "class A\n  def run\n    step\n  end\n  def step\n  end\nend\n",
+            ),
+            ("b.rb", "class B\n  def step\n  end\nend\n"),
+        ]);
+        assert_eq!(
+            target_of(&g, "run", "step").unwrap().owner.as_deref(),
+            Some("A")
+        );
+        // Rust has no implicit receiver: a bare call prefers the free function.
+        let g = graph(&[(
+            "a.rs",
+            "fn step() {}\nstruct A;\nimpl A {\n    fn step(&self) {}\n    fn run(&self) { step(); }\n}\n",
+        )]);
+        assert_eq!(target_of(&g, "run", "step").unwrap().owner, None);
+    }
+
+    #[test]
+    fn overloads_are_not_ambiguous() {
+        let g = graph(&[
+            (
+                "Svc.java",
+                "class Svc {\n  void log(String s) {}\n  void log(int n) {}\n  void run() { log(1); }\n}\n",
+            ),
+        ]);
+        let from = g.symbols().find(|s| s.name == "run").unwrap().id;
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Calls)
+            .unwrap();
+        assert!(e.to.is_some());
+        assert_eq!(e.alternatives, 0);
     }
 
     #[test]

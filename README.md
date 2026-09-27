@@ -38,7 +38,7 @@ an MCP server, and no cloud, no database, no Python.
 | PageRank repo map (optionally focused) | `codescope map [focus…]` | `cs_repo_map` |
 | Change impact of your diff + tests to run | `codescope diff-impact [--base REF]` | `cs_diff_impact` |
 
-**Languages:** Rust, TypeScript, JavaScript, Python, Go (tree-sitter).
+**Languages (10):** Rust, TypeScript, JavaScript, Python, Go, Java, C, C++, C#, Ruby (tree-sitter; see ADR-0019).
 
 Every query is **token-budgeted** (`--max-tokens`, default 4000): results are
 compact JSON with `symbol`, `kind`, `file`, `line_start/line_end`, edge lists,
@@ -73,7 +73,7 @@ codescope diff-impact --base main     # what your branch changed/affects + tests
 Space-separated terms; `key:value` are filters, bare words match name/signature:
 
 - `kind:function|method|struct|enum|trait|interface|class|module|type|constant|field`
-- `lang:rust|typescript|javascript|python|go`
+- `lang:rust|typescript|javascript|python|go|java|c|cpp|csharp|ruby`
 - `file:<substr>` · `name:<substr>` · `calls:<callee>` · `returns:<type-substr>` · `owner:<Type>` (alias `in:`)
 
 Symbol targets accept qualified names: `codescope callers Store::open`, `codescope refs store::open`.
@@ -135,7 +135,7 @@ repo → Walker (ignore-aware) → tree-sitter parsers → Symbol/edge extractio
 
 ## Documentation
 
-- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (18 ADRs).
+- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (19 ADRs).
 - **Domain-Driven Design:** [`docs/ddd/`](docs/ddd/) — ubiquitous language,
   bounded contexts, domain model, services & repositories.
 - **Benchmarks & validation:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).

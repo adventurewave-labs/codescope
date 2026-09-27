@@ -52,6 +52,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 notify = "6.1"
 # Misc
 once_cell = "1"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.23"
+tree-sitter-cpp = "0.23"
+tree-sitter-c-sharp = "=0.23.1"
+tree-sitter-ruby = "0.23"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

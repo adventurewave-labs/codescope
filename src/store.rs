@@ -23,11 +23,16 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// rather than failing to decode (ADR-0005).
 pub const SCHEMA_VERSION: &str = "2";
 
-/// Full index-compatibility key: record schema + crate version, so upgrading
+/// Full index-compatibility key: record schema + crate version + extraction
+/// query fingerprint, so upgrading
 /// codescope (whose extraction/resolution rules may have changed) re-extracts
 /// even files whose content hash is unchanged.
 fn schema_key() -> String {
-    format!("{SCHEMA_VERSION}+{}", env!("CARGO_PKG_VERSION"))
+    format!(
+        "{SCHEMA_VERSION}+{}+{:016x}",
+        env!("CARGO_PKG_VERSION"),
+        crate::extract::rules_fingerprint()
+    )
 }
 
 /// Serialize + LZ4-compress a file record for on-disk storage.

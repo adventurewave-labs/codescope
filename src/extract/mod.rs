@@ -18,6 +18,11 @@ const PYTHON_Q: &str = include_str!("../../queries/python.scm");
 const JS_Q: &str = include_str!("../../queries/javascript.scm");
 const TS_Q: &str = include_str!("../../queries/typescript.scm");
 const GO_Q: &str = include_str!("../../queries/go.scm");
+const JAVA_Q: &str = include_str!("../../queries/java.scm");
+const C_Q: &str = include_str!("../../queries/c.scm");
+const CPP_Q: &str = include_str!("../../queries/cpp.scm");
+const CSHARP_Q: &str = include_str!("../../queries/csharp.scm");
+const RUBY_Q: &str = include_str!("../../queries/ruby.scm");
 
 fn query_src(lang: Language) -> &'static str {
     match lang {
@@ -26,28 +31,48 @@ fn query_src(lang: Language) -> &'static str {
         Language::JavaScript => JS_Q,
         Language::TypeScript => TS_Q,
         Language::Go => GO_Q,
+        Language::Java => JAVA_Q,
+        Language::C => C_Q,
+        Language::Cpp => CPP_Q,
+        Language::CSharp => CSHARP_Q,
+        Language::Ruby => RUBY_Q,
     }
 }
 
-/// Compiled query cache, keyed by language. Compiled once per process.
-fn compiled_query(lang: Language) -> &'static Query {
-    static CACHE: OnceLock<HashMap<Language, Query>> = OnceLock::new();
+/// Fingerprint of every extraction query. Part of the index-compatibility key
+/// so editing a `queries/*.scm` file re-extracts unchanged sources (ADR-0005).
+pub fn rules_fingerprint() -> u64 {
+    let mut all = String::new();
+    for l in Language::ALL {
+        all.push_str(l.name());
+        all.push_str(query_src(l));
+    }
+    seahash::hash(all.as_bytes())
+}
+
+/// Compiled query cache, keyed by language. Each language compiles lazily and
+/// independently: a grammar/query mismatch in one language disables only that
+/// language (logged once) instead of taking the whole indexer down.
+fn compiled_query(lang: Language) -> Option<&'static Query> {
+    static CACHE: OnceLock<HashMap<Language, OnceLock<Option<Query>>>> = OnceLock::new();
     let map = CACHE.get_or_init(|| {
-        let mut m = HashMap::new();
-        for &l in &[
-            Language::Rust,
-            Language::Python,
-            Language::JavaScript,
-            Language::TypeScript,
-            Language::Go,
-        ] {
-            let q = Query::new(&parser::ts_language(l), query_src(l))
-                .unwrap_or_else(|e| panic!("invalid query for {l}: {e}"));
-            m.insert(l, q);
-        }
-        m
+        Language::ALL
+            .iter()
+            .map(|&l| (l, OnceLock::new()))
+            .collect()
     });
-    map.get(&lang).expect("query compiled for language")
+    map.get(&lang)?
+        .get_or_init(
+            || match Query::new(&parser::ts_language(lang), query_src(lang)) {
+                Ok(q) => Some(q),
+                Err(e) => {
+                    tracing::error!("codescope: disabling {lang}: invalid query/grammar: {e}");
+                    eprintln!("codescope: disabling {lang}: invalid query/grammar: {e}");
+                    None
+                }
+            },
+        )
+        .as_ref()
 }
 
 /// Map a `@def.<kind>` capture name to a [`SymbolKind`].
@@ -120,15 +145,21 @@ fn go_receiver_type(receiver: &str) -> Option<String> {
 /// `self.foo()` → `self`, `Store::open()` → `Store`, `a.b.c()` → `b`.
 fn call_qualifier(callee: Node, source: &str) -> Option<String> {
     let parent = callee.parent()?;
-    let field = match parent.kind() {
-        "field_expression" => "value",
-        "scoped_identifier" => "path",
-        "member_expression" => "object",
-        "attribute" => "object",
-        "selector_expression" => "operand",
+    let fields: &[&str] = match parent.kind() {
+        // Rust uses `value`, C/C++ use `argument`.
+        "field_expression" => &["value", "argument"],
+        "scoped_identifier" => &["path"],
+        "qualified_identifier" => &["scope"],
+        "member_expression" | "attribute" | "method_invocation" => &["object"],
+        "member_access_expression" => &["expression"],
+        "selector_expression" => &["operand"],
+        "call" => &["receiver"],
         _ => return None,
     };
-    let q = parent.child_by_field_name(field)?;
+    let q = fields.iter().find_map(|f| parent.child_by_field_name(f))?;
+    if q.id() == callee.id() {
+        return None;
+    }
     let text = &source[q.start_byte()..q.end_byte()];
     let last = text
         .rsplit("::")
@@ -181,13 +212,59 @@ pub(crate) fn infer_receiver_type(q: &str, scope: &str) -> Option<String> {
         } else {
             None
         };
-        if let Some(t) = candidate {
-            if t.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && t != "Self" {
+        let accept =
+            |t: &str| t.chars().next().is_some_and(|c| c.is_ascii_uppercase()) && t != "Self";
+        if let Some(t) = candidate.filter(|t| accept(t)) {
+            return Some(t);
+        }
+        // Type-before-name declarations (Java/C#/C/C++): `Store store`,
+        // `final Repo r =`, `(Foo *f,`, `List<Foo> xs`.
+        if rest.starts_with(['=', ';', ',', ')', ':']) || rest.is_empty() {
+            if let Some(t) = type_before(prev).filter(|t| accept(t)) {
                 return Some(t);
             }
         }
     }
     None
+}
+
+/// The type token immediately preceding a declared name, if any.
+fn type_before(prev: &str) -> Option<String> {
+    let prev = prev.trim_end_matches(['*', '&', ' ']);
+    // Skip one generic argument list: `List<Foo>` → `List`.
+    let prev = if prev.ends_with('>') {
+        let mut depth = 0i32;
+        let mut cut = None;
+        for (i, ch) in prev.char_indices().rev() {
+            match ch {
+                '>' => depth += 1,
+                '<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        cut = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        &prev[..cut?]
+    } else {
+        prev
+    };
+    let tok: String = prev
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':' || *c == '.')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let last = tok.rsplit("::").next()?.rsplit('.').next()?;
+    const KEYWORDS: &[&str] = &[
+        "return", "new", "await", "throw", "yield", "case", "in", "of",
+    ];
+    (!last.is_empty() && !KEYWORDS.contains(&last)).then(|| last.to_string())
 }
 
 fn annotation_type(r: &str) -> Option<String> {
@@ -300,7 +377,9 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
     let Some(tree) = parser::parse(lang, source) else {
         return empty();
     };
-    let query = compiled_query(lang);
+    let Some(query) = compiled_query(lang) else {
+        return empty();
+    };
     let root = tree.root_node();
 
     // A synthetic module symbol representing the file itself; used as the
@@ -374,12 +453,17 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
                 continue;
             }
             let span = span_of(dnode);
-            let owner = if dnode.kind() == "method_declaration" {
+            let owner = if dnode.kind() == "method_declaration" && lang == Language::Go {
                 dnode
                     .child_by_field_name("receiver")
                     .and_then(|r| go_receiver_type(&source[r.start_byte()..r.end_byte()]))
             } else {
-                None
+                // C++ out-of-line definition: `void Foo::bar() {}`.
+                name_node
+                    .and_then(|n| n.parent())
+                    .filter(|p| p.kind() == "qualified_identifier")
+                    .and_then(|p| p.child_by_field_name("scope"))
+                    .map(|scope| bare_type(&source[scope.start_byte()..scope.end_byte()]))
             };
             defs.push(DefRecord {
                 id: SymbolId(0), // assigned once the final kind is known
@@ -407,7 +491,7 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
         if let Some(inode) = import_node {
             let raw = source[inode.start_byte()..inode.end_byte()].to_string();
             let to_name = raw
-                .trim_matches(|c| c == '"' || c == '\'' || c == '`')
+                .trim_matches(|c| matches!(c, '"' | '\'' | '`' | '<' | '>'))
                 .to_string();
             sites.push(EdgeSite {
                 kind: EdgeKind::Imports,
@@ -437,7 +521,7 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
             matches!(
                 defs[j].kind,
                 SymbolKind::Class | SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Interface
-            )
+            ) || (lang == Language::Ruby && defs[j].kind == SymbolKind::Module)
         });
         // Innermost wins between an impl block and an enclosing type def.
         let from_impl = match (imp, encl) {
@@ -638,6 +722,160 @@ mod tests {
         assert_eq!(t("x", "if x == y {}"), None);
         assert_eq!(t("n", "let n = compute();"), None);
         assert_eq!(t("items", "items.push(1)"), None);
+        assert_eq!(
+            t("store", "void f(Store store) {}").as_deref(),
+            Some("Store")
+        );
+        assert_eq!(
+            t("r", "final Repo r = factory.make();").as_deref(),
+            Some("Repo")
+        );
+        assert_eq!(t("xs", "List<Foo> xs;").as_deref(), Some("List"));
+        assert_eq!(
+            t("xs", "List<Foo> xs = new ArrayList<>();").as_deref(),
+            Some("ArrayList")
+        );
+        assert_eq!(t("w", "Widget *w;").as_deref(), Some("Widget"));
+        assert_eq!(t("x", "return x;"), None);
+        assert_eq!(t("u", "u = User.new(name)").as_deref(), Some("User"));
+    }
+
+    fn by_name<'a>(f: &'a SourceFile, name: &str) -> &'a Symbol {
+        // Skip the synthetic per-file module (the only container-less symbol).
+        f.symbols
+            .iter()
+            .find(|s| s.name == name && s.container.is_some())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no symbol {name}: {:?}",
+                    f.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                )
+            })
+    }
+
+    fn call(f: &SourceFile, name: &str) -> Option<Option<String>> {
+        f.edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == name)
+            .map(|e| e.qualifier.clone())
+    }
+
+    fn imports(f: &SourceFile) -> Vec<&str> {
+        f.edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .map(|e| e.to_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn extracts_java() {
+        let src = "package app;\nimport java.util.List;\nimport app.store.Repo;\n\npublic class Service {\n    private Repo repo;\n    public Service(Repo r) { this.repo = r; }\n    public void run(Repo r) {\n        r.save();\n        helper();\n        new Widget();\n    }\n    void helper() {}\n}\ninterface Shape { double area(); }\nenum Color { RED }\nrecord Point(int x, int y) {}\n";
+        let f = extract(Language::Java, "Service.java", src, 0);
+        let run = by_name(&f, "run");
+        assert_eq!(
+            (run.kind, run.owner.as_deref()),
+            (SymbolKind::Method, Some("Service"))
+        );
+        assert_eq!(by_name(&f, "Shape").kind, SymbolKind::Interface);
+        assert_eq!(by_name(&f, "Color").kind, SymbolKind::Enum);
+        assert_eq!(by_name(&f, "Point").kind, SymbolKind::Class);
+        assert_eq!(
+            call(&f, "save"),
+            Some(Some("Repo".into())),
+            "receiver type inferred from param"
+        );
+        assert_eq!(call(&f, "helper"), Some(None));
+        assert!(call(&f, "Widget").is_some(), "constructor call");
+        assert_eq!(imports(&f), vec!["java.util.List", "app.store.Repo"]);
+    }
+
+    #[test]
+    fn extracts_c() {
+        let src = "#include <stdio.h>\n#include \"list.h\"\nstruct node { int v; };\ntypedef struct node node_t;\nenum color { RED };\nstatic int helper(int x) { return x; }\nchar *name(void) { return 0; }\nint main(void) {\n    struct ops *o;\n    helper(1);\n    o->run();\n    printf(\"hi\");\n    return 0;\n}\n";
+        let f = extract(Language::C, "main.c", src, 0);
+        for (n, k) in [
+            ("node", SymbolKind::Struct),
+            ("node_t", SymbolKind::Type),
+            ("color", SymbolKind::Enum),
+            ("helper", SymbolKind::Function),
+            ("name", SymbolKind::Function),
+            ("main", SymbolKind::Function),
+        ] {
+            assert_eq!(by_name(&f, n).kind, k, "{n}");
+        }
+        assert_eq!(call(&f, "helper"), Some(None));
+        assert_eq!(call(&f, "run"), Some(Some("o".into())));
+        assert_eq!(imports(&f), vec!["stdio.h", "list.h"]);
+    }
+
+    #[test]
+    fn extracts_cpp() {
+        let src = "#include <vector>\nnamespace app {\nclass Engine {\npublic:\n    void start() { tick(); }\n    void tick();\n};\nvoid Engine::tick() { util::log(); }\nstruct Point { int x; };\n}\nint main() {\n    app::Engine e;\n    e.start();\n    return 0;\n}\n";
+        let f = extract(Language::Cpp, "engine.cpp", src, 0);
+        assert_eq!(by_name(&f, "app").kind, SymbolKind::Module);
+        assert_eq!(by_name(&f, "Engine").kind, SymbolKind::Class);
+        let start = by_name(&f, "start");
+        assert_eq!(
+            (start.kind, start.owner.as_deref()),
+            (SymbolKind::Method, Some("Engine"))
+        );
+        let tick = f.symbols.iter().find(|s| s.name == "tick").unwrap();
+        assert_eq!(
+            tick.owner.as_deref(),
+            Some("Engine"),
+            "out-of-line definition owned"
+        );
+        assert_eq!(call(&f, "log"), Some(Some("util".into())));
+        assert_eq!(call(&f, "start"), Some(Some("Engine".into())));
+        assert_eq!(imports(&f), vec!["vector"]);
+    }
+
+    #[test]
+    fn extracts_csharp() {
+        let src = "using System;\nusing App.Data;\nnamespace App.Core {\n    public class OrderService {\n        public OrderService(Repo repo) {}\n        public void Place(Repo repo) {\n            repo.Save();\n            Validate();\n            var o = new Order();\n        }\n        private void Validate() {}\n    }\n    public interface IRepo { void Save(); }\n    public struct Money {}\n    public enum Status { Open }\n}\n";
+        let f = extract(Language::CSharp, "OrderService.cs", src, 0);
+        let place = by_name(&f, "Place");
+        assert_eq!(
+            (place.kind, place.owner.as_deref()),
+            (SymbolKind::Method, Some("OrderService"))
+        );
+        assert_eq!(by_name(&f, "IRepo").kind, SymbolKind::Interface);
+        assert_eq!(by_name(&f, "Money").kind, SymbolKind::Struct);
+        assert_eq!(by_name(&f, "Status").kind, SymbolKind::Enum);
+        assert_eq!(call(&f, "Save"), Some(Some("Repo".into())));
+        assert_eq!(call(&f, "Validate"), Some(None));
+        assert!(call(&f, "Order").is_some());
+        assert_eq!(imports(&f), vec!["System", "App.Data"]);
+    }
+
+    #[test]
+    fn extracts_ruby() {
+        let src = "require 'json'\nrequire_relative 'store/repo'\n\nmodule Billing\n  class Invoice\n    def total\n      items\n      items.sum\n      tax_for(1)\n    end\n\n    def self.build\n      r = Repo.new\n      r.save\n    end\n\n    def tax_for(x)\n      x\n    end\n  end\nend\n\ndef top_level\nend\n";
+        let f = extract(Language::Ruby, "invoice.rb", src, 0);
+        assert_eq!(by_name(&f, "Billing").kind, SymbolKind::Module);
+        assert_eq!(by_name(&f, "Invoice").kind, SymbolKind::Class);
+        let total = by_name(&f, "total");
+        assert_eq!(
+            (total.kind, total.owner.as_deref()),
+            (SymbolKind::Method, Some("Invoice"))
+        );
+        assert_eq!(by_name(&f, "build").owner.as_deref(), Some("Invoice"));
+        assert_eq!(by_name(&f, "top_level").kind, SymbolKind::Function);
+        assert_eq!(call(&f, "tax_for"), Some(None));
+        assert_eq!(call(&f, "items"), Some(None), "paren-less statement call");
+        assert_eq!(call(&f, "save"), Some(Some("Repo".into())));
+        assert_eq!(imports(&f), vec!["json", "store/repo"]);
+    }
+
+    #[test]
+    fn every_language_query_compiles() {
+        for lang in Language::ALL {
+            assert!(
+                compiled_query(lang).is_some(),
+                "{lang} query must compile against its grammar"
+            );
+        }
     }
 
     #[test]
