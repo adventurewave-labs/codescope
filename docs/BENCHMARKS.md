@@ -89,3 +89,16 @@ keeps this swappable without touching the query or extraction layers.
 - **Correctness**: 24 unit/integration tests (`cargo test`), plus dogfooding —
   `codescope` indexes its own source and answers callers/callees/blast-radius
   correctly.
+
+## Freshness & reload (ADR-0020)
+
+Release build, 4-core container, `cargo run --release --example fresh_latency -- <repo>`:
+
+| Repo | Files | Edges | Full load (before) | Full load | Stat check | 1-file refresh |
+|---|---|---|---|---|---|---|
+| codescope | 21 | 2.8k | 9 ms | 7 ms | 3 ms | 19 ms |
+| gson (Java) | 264 | 30k | 207 ms | 34 ms | 4 ms | 36 ms |
+| fmt (C++) | 79 | 25k | 149 ms | 30 ms | 3 ms | 80 ms |
+| dotnet/samples (C#) | 3,166 | 129k | 674 ms | 318 ms | 46 ms | 213 ms |
+
+"Before" = pre-ADR-0020 resolver (per-candidate import re-splitting, edge cloning).

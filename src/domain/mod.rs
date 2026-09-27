@@ -351,6 +351,28 @@ impl CodeGraph {
         self.edges.retain(|e| !removed_set.contains(&e.from));
     }
 
+    /// Remove every symbol and edge originating from any of `paths` in a
+    /// single pass (O(symbols + edges), independent of `paths.len()`).
+    pub fn remove_files(&mut self, paths: &std::collections::HashSet<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut removed = std::collections::HashSet::new();
+        self.symbols.retain(|id, s| {
+            let drop = paths.contains(&s.file);
+            if drop {
+                removed.insert(*id);
+            }
+            !drop
+        });
+        self.edges.retain(|e| !removed.contains(&e.from));
+    }
+
+    /// Mutable access to every edge (resolver re-binding).
+    pub fn edges_mut(&mut self) -> &mut [Edge] {
+        &mut self.edges
+    }
+
     /// Replace the entire edge set (used by the resolver after binding targets).
     /// Caller must invoke [`CodeGraph::reindex`] afterwards.
     pub fn replace_edges(&mut self, edges: Vec<Edge>) {
@@ -474,6 +496,43 @@ mod tests {
             Some(Language::Python)
         );
         assert_eq!(Language::from_path(Path::new("a.txt")), None);
+    }
+
+    #[test]
+    fn remove_files_batch() {
+        let mut g = CodeGraph::new();
+        for p in ["a.rs", "b.rs", "c.rs"] {
+            let id = SymbolId::compute(Language::Rust, p, "f", SymbolKind::Function, 1);
+            g.upsert_file(SourceFile {
+                path: p.into(),
+                language: Language::Rust,
+                content_hash: 0,
+                symbols: vec![Symbol {
+                    id,
+                    name: "f".into(),
+                    kind: SymbolKind::Function,
+                    signature: String::new(),
+                    language: Language::Rust,
+                    file: p.into(),
+                    span: Span {
+                        line_start: 1,
+                        line_end: 1,
+                        byte_start: 0,
+                        byte_end: 1,
+                    },
+                    container: None,
+                    owner: None,
+                }],
+                edges: vec![],
+            });
+        }
+        g.remove_files(
+            &["a.rs".to_string(), "c.rs".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        g.reindex();
+        assert_eq!(g.files(), vec!["b.rs".to_string()]);
     }
 
     #[test]

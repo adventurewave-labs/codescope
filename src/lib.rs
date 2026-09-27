@@ -12,11 +12,14 @@
 //! * [`query`] — agent-facing query application services.
 //! * [`rank`] — PageRank centrality for repo maps and summaries.
 //! * [`diff`] — git-diff change-impact analysis.
+//! * [`fresh`] — staleness checks + incremental in-memory patching.
+//! * [`watch`] — file-watcher driven re-indexing.
 //! * [`interfaces`] — CLI / JSON / MCP surfaces.
 
 pub mod diff;
 pub mod domain;
 pub mod extract;
+pub mod fresh;
 pub mod index;
 pub mod interfaces;
 pub mod parser;
@@ -25,6 +28,7 @@ pub mod rank;
 pub mod resolve;
 pub mod store;
 pub mod walker;
+pub mod watch;
 
 use std::path::{Path, PathBuf};
 
