@@ -4,8 +4,9 @@
 //! tools. Logs go to stderr only; stdout carries protocol messages exclusively
 //! (ADR-0013).
 
+use crate::fresh::{FreshInfo, LiveGraph};
 use crate::query::{self, DEFAULT_MAX_TOKENS};
-use crate::{domain::CodeGraph, index, index_path, store::Store};
+use crate::{domain::CodeGraph, index};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -23,33 +24,40 @@ fn negotiate(requested: Option<&str>) -> &'static str {
 
 struct Server {
     root: PathBuf,
-    graph: Option<CodeGraph>,
+    live: Option<LiveGraph>,
 }
 
 impl Server {
     fn new(root: PathBuf) -> Self {
-        Server { root, graph: None }
+        Server { root, live: None }
     }
 
-    /// Lazily load (and cache) the code graph. If no index exists yet, build
-    /// one first so agents never have to remember to call `cs_index`.
-    fn graph(&mut self) -> Result<&CodeGraph> {
-        if self.graph.is_none() {
-            if !index_path(&self.root).exists() {
-                self.reindex()?;
-            } else {
-                let store = Store::open(&index_path(&self.root))?;
-                self.graph = Some(store.load_graph()?);
-            }
+    /// The live graph, opened (and built, if no index exists) on first use,
+    /// and refreshed before answering when files changed since the last
+    /// index (throttled stat check; ADR-0020).
+    fn graph(&mut self) -> Result<(&CodeGraph, FreshInfo)> {
+        if self.live.is_none() {
+            self.live = Some(LiveGraph::open(&self.root)?);
         }
-        Ok(self.graph.as_ref().expect("graph loaded"))
+        let live = self.live.as_mut().expect("opened");
+        let info = live.ensure_fresh();
+        Ok((live.graph(), info))
     }
 
     fn reindex(&mut self) -> Result<index::IndexStats> {
-        let mut store = Store::open(&index_path(&self.root))?;
-        let stats = index::build_index(&self.root, &mut store)?;
-        self.graph = Some(store.load_graph()?);
-        Ok(stats)
+        match self.live.as_mut() {
+            Some(live) => Ok(live.refresh()?.stats),
+            None => {
+                let live = LiveGraph::open(&self.root)?;
+                let stats = index::IndexStats {
+                    symbols: live.graph().symbol_count(),
+                    edges: live.graph().edge_count(),
+                    ..Default::default()
+                };
+                self.live = Some(live);
+                Ok(stats)
+            }
+        }
     }
 }
 
@@ -161,26 +169,35 @@ fn call_tool(server: &mut Server, params: &Value) -> std::result::Result<Value, 
         })));
     }
 
-    let graph = server
-        .graph()
-        .map_err(|e| (-32000, format!("index unavailable: {e}")))?;
-
-    // cs_diff_impact refreshes the index first so spans match the working tree.
-    if name == "cs_diff_impact" {
-        let base = str_arg("base");
+    // cs_diff_impact: spans must match the working tree exactly, so resolve
+    // the change set first and force a (cheap, incremental) refresh.
+    let changes = if name == "cs_diff_impact" {
         let changes = match str_arg("diff") {
             Some(d) => crate::diff::parse_unified_diff(&d),
-            None => crate::diff::git_changes(&server.root, base.as_deref())
+            None => crate::diff::git_changes(&server.root, str_arg("base").as_deref())
                 .map_err(|e| (-32000, e.to_string()))?,
         };
         server.reindex().map_err(|e| (-32000, e.to_string()))?;
-        let graph = server.graph().map_err(|e| (-32000, e.to_string()))?;
-        let base = base.unwrap_or_else(|| "HEAD".into());
-        let r = crate::diff::diff_impact(graph, &changes, &base, max_tokens);
-        return Ok(tool_result(serde_json::to_value(r).unwrap()));
-    }
+        Some(changes)
+    } else {
+        None
+    };
 
-    let payload: Value = match name {
+    let (graph, freshness) = server
+        .graph()
+        .map_err(|e| (-32000, format!("index unavailable: {e}")))?;
+
+    let mut payload: Value = match name {
+        "cs_diff_impact" => {
+            let base = str_arg("base").unwrap_or_else(|| "HEAD".into());
+            let r = crate::diff::diff_impact(
+                graph,
+                changes.as_ref().expect("computed"),
+                &base,
+                max_tokens,
+            );
+            serde_json::to_value(r).unwrap()
+        }
         "cs_callers" => {
             let s = str_arg("symbol").ok_or((-32602, "missing 'symbol'".into()))?;
             serde_json::to_value(query::callers(graph, &s, depth, max_tokens)).unwrap()
@@ -223,6 +240,9 @@ fn call_tool(server: &mut Server, params: &Value) -> std::result::Result<Value, 
         other => return Err((-32602, format!("unknown tool: {other}"))),
     };
 
+    if let Value::Object(map) = &mut payload {
+        map.insert("freshness".into(), serde_json::to_value(freshness).unwrap());
+    }
     Ok(tool_result(payload))
 }
 
@@ -412,6 +432,17 @@ mod tests {
         );
 
         let diff = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-fn hub() {}\n+fn hub() { }\n";
+        // Edit a file between queries: the next answer reflects it with no cs_index.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::fs::write(dir.path().join("b.rs"), "fn b() { hub(); }\n").unwrap();
+        let call = json!({"jsonrpc":"2.0","id":6,"method":"tools/call",
+            "params":{"name":"cs_callers","arguments":{"symbol":"hub"}}});
+        let resp = handle(&mut server, &call).unwrap();
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["count"], 2, "auto-refreshed: {sc}");
+        assert_eq!(sc["freshness"]["refreshed"], true);
+        assert_eq!(sc["freshness"]["stale"], false);
+
         let di = json!({"jsonrpc":"2.0","id":5,"method":"tools/call",
             "params":{"name":"cs_diff_impact","arguments":{"diff": diff}}});
         let resp = handle(&mut server, &di).unwrap();

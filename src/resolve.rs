@@ -12,6 +12,7 @@
 //! work; the data model already carries [`Confidence`] so it can slot in.
 
 use crate::domain::{CodeGraph, Confidence, Edge, EdgeKind, Language, SymbolId, SymbolKind};
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// What the resolver needs to know about a candidate target.
@@ -60,8 +61,61 @@ fn is_self_qualifier(q: &str) -> bool {
     matches!(q, "self" | "Self" | "this" | "cls" | "super")
 }
 
+/// Drop every heuristic binding and resolve the whole graph again. Used after
+/// an incremental patch: a changed file can invalidate bindings anywhere
+/// (a removed target, a new better candidate), and re-resolving in memory is
+/// far cheaper than re-decoding the store (ADR-0020).
+pub fn re_resolve(graph: &mut CodeGraph) {
+    for e in graph.edges_mut() {
+        if e.kind != EdgeKind::Contains && e.confidence == Confidence::Heuristic {
+            e.to = None;
+            e.alternatives = 0;
+        }
+    }
+    resolve(graph);
+}
+
+/// What an incremental patch touched: bindings outside this scope cannot
+/// change, because a binding depends only on (a) the caller's own file (its
+/// imports, owner, path) and (b) the candidate set for the called *name*.
+pub struct Scope {
+    /// Files re-extracted or removed.
+    pub files: std::collections::HashSet<String>,
+    /// Names of every symbol removed from or added to the graph.
+    pub names: std::collections::HashSet<String>,
+}
+
+fn last_seg(name: &str) -> &str {
+    name.rsplit("::")
+        .next()
+        .and_then(|s| s.rsplit('.').next())
+        .unwrap_or(name)
+}
+
+/// Incremental counterpart of [`re_resolve`]: unbind and re-resolve only
+/// edges whose binding could have changed (ADR-0020). Equivalent to a full
+/// re-resolve; much cheaper when little changed.
+pub fn re_resolve_scoped(graph: &mut CodeGraph, scope: &Scope) {
+    // Edges from touched files are freshly extracted (already unbound).
+    for e in graph.edges_mut() {
+        if e.kind != EdgeKind::Contains
+            && e.confidence == Confidence::Heuristic
+            && e.to.is_some()
+            && scope.names.contains(last_seg(&e.to_name))
+        {
+            e.to = None;
+            e.alternatives = 0;
+        }
+    }
+    resolve_in(graph, Some(scope));
+}
+
 /// Resolve all unresolved edges in place and rebuild indexes.
 pub fn resolve(graph: &mut CodeGraph) {
+    resolve_in(graph, None);
+}
+
+fn resolve_in(graph: &mut CodeGraph, scope: Option<&Scope>) {
     // Snapshot the lookups we need (immutable borrow) before mutating edges.
     let mut name_index: HashMap<&str, Vec<Cand>> = HashMap::new();
     for s in graph.symbols() {
@@ -80,67 +134,82 @@ pub fn resolve(graph: &mut CodeGraph) {
         v.sort_by_key(|c| c.id);
     }
 
-    // Per-file import strings (for import-aware scoring).
-    let mut imports: HashMap<&str, Vec<&str>> = HashMap::new();
+    // Per-file set of import path segments (for O(1) import-aware scoring).
+    let mut imports: HashMap<&str, ImportSet> = HashMap::new();
     for e in graph.edges() {
         if e.kind == EdgeKind::Imports {
             if let Some(s) = graph.symbol(e.from) {
-                imports
-                    .entry(s.file.as_str())
-                    .or_default()
-                    .push(e.to_name.as_str());
+                imports.entry(s.file.as_str()).or_default().add(&e.to_name);
             }
         }
     }
+    let no_imports = ImportSet::default();
 
-    let mut resolved: Vec<Edge> = Vec::with_capacity(graph.edge_count());
-    for edge in graph.edges() {
-        if edge.to.is_some() {
-            resolved.push(edge.clone());
-            continue;
-        }
-        let mut e = edge.clone();
-        if let Some(src) = graph.symbol(edge.from) {
+    // Compute bindings under an immutable borrow, then apply in place — no
+    // edge cloning (ADR-0020: re-resolution is on the incremental hot path).
+    let bindings: Vec<(usize, SymbolId, u16)> = graph
+        .edges()
+        .par_iter()
+        .enumerate()
+        .filter(|(_, e)| e.to.is_none())
+        .filter_map(|(i, edge)| {
+            let src = graph.symbol(edge.from)?;
+            if let Some(sc) = scope {
+                // Unbound edges outside the scope were unbound before and
+                // would stay so — skip re-trying them (mostly external calls).
+                if !sc.files.contains(&src.file) && !sc.names.contains(last_seg(&edge.to_name)) {
+                    return None;
+                }
+            }
             let caller = Caller {
                 file: &src.file,
                 owner: src.owner.as_deref(),
                 language: src.language,
             };
-            let file_imports = imports
-                .get(src.file.as_str())
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            if let Some((to, alternatives)) = resolve_one(edge, &caller, file_imports, &name_index)
-            {
-                e.to = Some(to);
-                e.alternatives = alternatives;
-                e.confidence = Confidence::Heuristic;
-            }
-        }
-        resolved.push(e);
-    }
+            let file_imports = imports.get(src.file.as_str()).unwrap_or(&no_imports);
+            resolve_one(edge, &caller, file_imports, &name_index).map(|(to, alts)| (i, to, alts))
+        })
+        .collect();
+    drop(name_index);
+    drop(imports);
 
-    graph.replace_edges(resolved);
+    let edges = graph.edges_mut();
+    for (i, to, alternatives) in bindings {
+        let e = &mut edges[i];
+        e.to = Some(to);
+        e.alternatives = alternatives;
+        e.confidence = Confidence::Heuristic;
+    }
     graph.reindex();
 }
 
-/// How strongly an import string refers to the candidate's module: 3 when it
-/// names the file's module (`pkg.beta`, `crate::store`), 2 when it only names
-/// the package directory (Go-style `".../store"`), 0 otherwise.
-fn import_score(import: &str, c: &Cand) -> u32 {
-    let mut best = 0;
-    for seg in import
-        .split([':', '.', '/', '{', '}', ',', ' ', '"', '\''])
-        .filter(|s| !s.is_empty())
-    {
-        if seg == c.stem {
-            return 3;
-        }
-        if !c.dir.is_empty() && seg == c.dir {
-            best = 2;
+/// The distinct path segments named by a file's imports.
+#[derive(Default)]
+struct ImportSet(std::collections::HashSet<String>);
+
+impl ImportSet {
+    fn add(&mut self, import: &str) {
+        for seg in import
+            .split([':', '.', '/', '{', '}', ',', ' ', '"', '\''])
+            .filter(|s| !s.is_empty())
+        {
+            self.0.insert(seg.to_string());
         }
     }
-    best
+
+    /// 3 when an import names the candidate's module (`pkg.beta`,
+    /// `crate::store`), 2 when only its package directory (Go-style), else 0.
+    fn score(&self, c: &Cand) -> u32 {
+        if self.0.is_empty() {
+            0
+        } else if self.0.contains(&c.stem) {
+            3
+        } else if !c.dir.is_empty() && self.0.contains(&c.dir) {
+            2
+        } else {
+            0
+        }
+    }
 }
 
 /// Score candidates and return the best `(target, tied_alternatives)`.
@@ -155,7 +224,7 @@ fn import_score(import: &str, c: &Cand) -> u32 {
 fn resolve_one(
     edge: &Edge,
     caller: &Caller,
-    file_imports: &[&str],
+    file_imports: &ImportSet,
     name_index: &HashMap<&str, Vec<Cand>>,
 ) -> Option<(SymbolId, u16)> {
     // The callee/reference name may be a path tail; match on the last segment.
@@ -210,11 +279,7 @@ fn resolve_one(
         if c.file == caller.file {
             score += 4;
         }
-        score += file_imports
-            .iter()
-            .map(|i| import_score(i, c))
-            .max()
-            .unwrap_or(0);
+        score += file_imports.score(c);
         match best {
             Some((_, b)) if b > score => {}
             Some((_, b)) if b == score => {

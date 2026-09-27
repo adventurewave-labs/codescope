@@ -116,3 +116,13 @@ Errors use standard JSON-RPC error objects:
 - Tools carry `annotations` (`readOnlyHint`, …); execution failures come back as `isError: true`.
 - The index is built automatically on the first query if missing.
 - Misses return `suggestions` ("did you mean").
+
+## Freshness (ADR-0020)
+
+Every tool result includes `freshness`:
+
+```json
+{"index_age_ms": 12, "refreshed": true, "files_changed": 1, "refresh_ms": 36, "stale": false}
+```
+
+The server stat-checks the tree at most every 250 ms and incrementally patches changed files before answering; `cs_index` is only needed to force a refresh.

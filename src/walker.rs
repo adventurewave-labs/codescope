@@ -20,35 +20,41 @@ pub struct DiscoveredFile {
 /// Walk `root` respecting `.gitignore`/`.ignore` and standard ignore rules,
 /// returning every file in a language we support.
 pub fn walk(root: &Path) -> Vec<DiscoveredFile> {
-    let mut out = Vec::new();
-    let walker = WalkBuilder::new(root)
+    let out = std::sync::Mutex::new(Vec::new());
+    WalkBuilder::new(root)
         .hidden(false) // don't skip dotfiles by default; .gitignore still applies
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .require_git(false) // honor .gitignore even outside a git repo
         .parents(true)
-        .build();
-
-    for entry in walker.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(language) = Language::from_path(path) else {
-            continue;
-        };
-        let rel_path = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        out.push(DiscoveredFile {
-            abs_path: path.to_path_buf(),
-            rel_path,
-            language,
+        .build_parallel()
+        .run(|| {
+            let out = &out;
+            Box::new(move |entry| {
+                let Ok(entry) = entry else {
+                    return ignore::WalkState::Continue;
+                };
+                if !entry.file_type().is_some_and(|t| t.is_file()) {
+                    return ignore::WalkState::Continue;
+                }
+                let path = entry.path();
+                if let Some(language) = Language::from_path(path) {
+                    let rel_path = path
+                        .strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.lock().expect("walker mutex").push(DiscoveredFile {
+                        abs_path: path.to_path_buf(),
+                        rel_path,
+                        language,
+                    });
+                }
+                ignore::WalkState::Continue
+            })
         });
-    }
+    let mut out = out.into_inner().expect("walker mutex");
     out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     out
 }

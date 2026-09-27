@@ -1,5 +1,6 @@
 //! CLI surface (ADR-0009). Verbs map 1:1 to query application services.
 
+use crate::fresh::LiveGraph;
 use crate::query::{self, QueryResult, DEFAULT_MAX_TOKENS};
 use crate::{index, index_path, store::Store};
 use anyhow::{Context, Result};
@@ -25,6 +26,10 @@ pub struct Cli {
     /// Token budget for query answers.
     #[arg(long, global = true, default_value_t = DEFAULT_MAX_TOKENS)]
     pub max_tokens: usize,
+
+    /// Don't auto-refresh a stale index before answering a query.
+    #[arg(long, global = true)]
+    pub no_refresh: bool,
 
     /// Increase log verbosity (logs go to stderr only).
     #[arg(short = 'v', long, global = true)]
@@ -74,6 +79,14 @@ pub enum Command {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Watch the repo and incrementally re-index on every change.
+    Watch {
+        /// Quiet period that ends a burst of changes (ms).
+        #[arg(long, default_value_t = 200)]
+        debounce_ms: u64,
+    },
+    /// Report whether the index is behind the working tree (stat-only).
+    Status,
     /// Start the MCP server over stdio.
     Serve {
         /// Serve the MCP protocol over stdio (default and only mode).
@@ -158,32 +171,91 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         other => {
             // All remaining verbs are read-only queries over the loaded graph.
-            let store = open_store(&cli.path)?;
-            let graph = store
-                .load_graph()
-                .context("failed to load index; run `codescope index` first")?;
+            if let Command::Watch { debounce_ms } = other {
+                // Build (or catch up) first so the index is fresh from t0.
+                let mut store = open_store(&cli.path)?;
+                let s = index::build_index(&cli.path, &mut store).context("indexing failed")?;
+                drop(store);
+                eprintln!(
+                    "codescope: watching {} ({} symbols, {} edges; initial pass {} ms) — Ctrl-C to stop",
+                    cli.path.display(),
+                    s.symbols,
+                    s.edges,
+                    s.elapsed_ms
+                );
+                return crate::watch::watch(
+                    &cli.path,
+                    std::time::Duration::from_millis(debounce_ms),
+                    None,
+                    |s| {
+                        let line = serde_json::json!({
+                            "files_indexed": s.files_indexed,
+                            "files_removed": s.files_removed,
+                            "elapsed_ms": s.elapsed_ms,
+                        });
+                        if json {
+                            println!("{line}");
+                        } else {
+                            println!(
+                                "re-indexed {} file(s), removed {} in {} ms",
+                                s.files_indexed, s.files_removed, s.elapsed_ms
+                            );
+                        }
+                    },
+                );
+            }
+            let mut live = LiveGraph::open(&cli.path)?;
+            if let Command::Status = other {
+                let st = live.staleness();
+                let age = live.index_age_ms();
+                if json {
+                    let mut v = serde_json::to_value(&st)?;
+                    v["index_age_ms"] = age.into();
+                    println!("{v}");
+                } else if st.stale {
+                    println!(
+                        "stale: {} modified, {} added, {} removed (index age {} ms)",
+                        st.modified, st.added, st.removed, age
+                    );
+                } else {
+                    println!("fresh (index age {age} ms)");
+                }
+                return Ok(());
+            }
+            if !cli.no_refresh {
+                live.check_interval = std::time::Duration::ZERO;
+                let info = live.ensure_fresh();
+                if info.refreshed && cli.verbose {
+                    eprintln!(
+                        "codescope: refreshed {} file(s) in {} ms",
+                        info.files_changed,
+                        info.refresh_ms.unwrap_or(0)
+                    );
+                }
+            }
+            let graph = live.graph();
             match other {
                 Command::Callers { symbol, depth } => {
-                    emit(query::callers(&graph, &symbol, depth, max_tokens), json)
+                    emit(query::callers(graph, &symbol, depth, max_tokens), json)
                 }
                 Command::Callees { symbol, depth } => {
-                    emit(query::callees(&graph, &symbol, depth, max_tokens), json)
+                    emit(query::callees(graph, &symbol, depth, max_tokens), json)
                 }
                 Command::BlastRadius { target } => {
-                    emit(query::blast_radius(&graph, &target, max_tokens), json)
+                    emit(query::blast_radius(graph, &target, max_tokens), json)
                 }
                 Command::Refs { symbol } => {
-                    emit(query::references(&graph, &symbol, max_tokens), json)
+                    emit(query::references(graph, &symbol, max_tokens), json)
                 }
                 Command::Def { symbol } => {
-                    emit(query::definition(&graph, &symbol, max_tokens), json)
+                    emit(query::definition(graph, &symbol, max_tokens), json)
                 }
                 Command::Search { query } => emit(
-                    query::structural_search(&graph, &query.join(" "), max_tokens),
+                    query::structural_search(graph, &query.join(" "), max_tokens),
                     json,
                 ),
                 Command::Deps => {
-                    let dg = query::dependency_graph(&graph, max_tokens);
+                    let dg = query::dependency_graph(graph, max_tokens);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&dg)?);
                     } else {
@@ -207,7 +279,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 Command::Summary => {
-                    let s = query::repo_summary(&graph, max_tokens);
+                    let s = query::repo_summary(graph, max_tokens);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&s)?);
                     } else {
@@ -244,7 +316,7 @@ pub fn run(cli: Cli) -> Result<()> {
                     }
                 }
                 Command::Map { focus } => {
-                    let m = query::repo_map(&graph, &focus, max_tokens);
+                    let m = query::repo_map(graph, &focus, max_tokens);
                     if json {
                         println!("{}", serde_json::to_string_pretty(&m)?);
                     } else {
@@ -265,7 +337,7 @@ pub fn run(cli: Cli) -> Result<()> {
                         }
                     }
                 }
-                _ => unreachable!("index/serve/diff-impact handled above"),
+                _ => unreachable!("index/serve/diff-impact/watch/status handled above"),
             }
         }
     }

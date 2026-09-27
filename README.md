@@ -37,6 +37,8 @@ an MCP server, and no cloud, no database, no Python.
 | Architectural overview | `codescope summary` | `cs_repo_summary` |
 | PageRank repo map (optionally focused) | `codescope map [focus…]` | `cs_repo_map` |
 | Change impact of your diff + tests to run | `codescope diff-impact [--base REF]` | `cs_diff_impact` |
+| Keep the index fresh as you edit | `codescope watch` | automatic |
+| Is the index behind the tree? | `codescope status` | `freshness` on every result |
 
 **Languages (10):** Rust, TypeScript, JavaScript, Python, Go, Java, C, C++, C#, Ruby (tree-sitter; see ADR-0019).
 
@@ -66,6 +68,8 @@ codescope callees do_thing --json     # machine-readable output
 codescope map --max-tokens 1500       # ranked repo map (Aider-style)
 codescope map src/auth.rs login       # map personalized to what you're editing
 codescope diff-impact --base main     # what your branch changed/affects + tests to run
+codescope watch                       # re-index incrementally on every save
+codescope status                      # fresh / stale (stat-only check)
 ```
 
 ### Structural search
@@ -104,7 +108,9 @@ VS Code/Copilot, Cline, Zed, Continue). Example config:
 }
 ```
 
-Then the agent can call `cs_index` once and query `cs_callers`, `cs_blast_radius`,
+No `cs_index` call is needed: the server builds the index on first use and,
+before each answer, runs a cheap stat check and incrementally patches in any
+files changed since (every result carries `freshness`; ADR-0020). Query `cs_callers`, `cs_blast_radius`,
 `cs_structural_search`, etc. See [`docs/mcp.md`](docs/mcp.md) for the full tool
 reference.
 
@@ -113,7 +119,9 @@ reference.
 Measured on a 4-core container (release build) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md):
 
 - Cold index **100k LOC in ~0.2 s**; **~1M LOC in ~1.6 s**.
-- Incremental re-index of one changed file in **~55 ms**.
+- Incremental re-index of one changed file in **~55 ms**; queries auto-refresh
+  after edits (stat check ~4 ms / 1-file patch ~36 ms on a 264-file Java repo —
+  see ADR-0020).
 - In-process query latency **< 2 ms** for every query type.
 - On-disk index size is the one PRD target not met (~75% vs. <15%); the cause
   and remediation are documented honestly in the benchmarks doc and ADR-0005.
@@ -135,7 +143,7 @@ repo → Walker (ignore-aware) → tree-sitter parsers → Symbol/edge extractio
 
 ## Documentation
 
-- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (19 ADRs).
+- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (20 ADRs).
 - **Domain-Driven Design:** [`docs/ddd/`](docs/ddd/) — ubiquitous language,
   bounded contexts, domain model, services & repositories.
 - **Benchmarks & validation:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
