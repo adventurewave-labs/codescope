@@ -25,3 +25,4 @@ This directory records the architecture decisions for `codescope`, written in th
 | [0019](0019-java-c-cpp-csharp-ruby.md) | Java, C, C++, C#, Ruby | Accepted |
 | [0020](0020-freshness.md) | Freshness: Auto-Refresh, Incremental Patching, Watch | Accepted |
 | [0021](0021-hybrid-search.md) | Hybrid Natural-Language Symbol Search | Accepted |
+| [0022](0022-accuracy-eval-and-release.md) | Accuracy Eval Harness & Release Pipeline | Accepted |

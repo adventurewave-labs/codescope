@@ -11,7 +11,7 @@
 
 ![codescope indexing itself and answering blast-radius queries](demo.gif)
 
-*codescope indexing its own repo — 196 symbols, 1,322 edges in 188 ms — then a summary and a blast-radius query. Recorded from the actual binary with [asciinema](https://asciinema.org) + [agg](https://github.com/asciinema/agg).*
+*codescope v0.1 indexing its own repo — 196 symbols, 1,322 edges in 188 ms — then a summary and a blast-radius query. Recorded from the actual binary with [asciinema](https://asciinema.org) + [agg](https://github.com/asciinema/agg).*
 
 `codescope` indexes any repository into a precise, queryable structural graph and
 serves it to AI agents over **MCP** (and CLI/JSON). Instead of letting an agent
@@ -21,6 +21,12 @@ depend on"* in milliseconds — with **token-budgeted** output.
 
 The precision of Sourcegraph, the install footprint of ripgrep, the interface of
 an MCP server, and no cloud, no database, no Python.
+
+**What's inside (v0.3):** PageRank repo maps · natural-language `find`
+(BM25F + centrality, no model needed) · git-diff change impact with the tests to
+run · owner/receiver-aware call resolution (**precision 1.00 / recall 0.97** on
+the annotated eval suite) · an index that keeps itself fresh as you edit ·
+10 languages · MCP 2025-06-18.
 
 ## Capabilities
 
@@ -49,10 +55,22 @@ and a `truncated` flag instead of dumping the whole graph.
 
 ## Install
 
+Prebuilt binaries (Linux x86_64/aarch64 static musl, macOS arm64/x86_64,
+Windows x86_64) are attached to every
+[GitHub Release](https://github.com/adventurewave-labs/codescope/releases):
+
 ```sh
-cargo install --path .        # from this checkout
-# or, once published:
-# cargo install codescope
+# example: Linux x86_64
+curl -L https://github.com/adventurewave-labs/codescope/releases/latest/download/codescope-v0.3.0-x86_64-unknown-linux-musl.tar.gz | tar xz
+sudo mv codescope-*/codescope /usr/local/bin/
+```
+
+From source:
+
+```sh
+cargo install --git https://github.com/adventurewave-labs/codescope
+# or, from a checkout:
+cargo install --path .
 ```
 
 ## Usage
@@ -98,7 +116,13 @@ codescope serve --mcp
 ```
 
 Register it with any MCP-capable agent (Claude Code, Cursor, Windsurf,
-VS Code/Copilot, Cline, Zed, Continue). Example config:
+VS Code/Copilot, Cline, Zed, Continue). With Claude Code:
+
+```sh
+claude mcp add codescope -- codescope serve --mcp -p /abs/path/to/your/repo
+```
+
+Or in a JSON MCP config:
 
 ```json
 {
@@ -113,9 +137,15 @@ VS Code/Copilot, Cline, Zed, Continue). Example config:
 
 No `cs_index` call is needed: the server builds the index on first use and,
 before each answer, runs a cheap stat check and incrementally patches in any
-files changed since (every result carries `freshness`; ADR-0020). Query `cs_callers`, `cs_blast_radius`,
-`cs_structural_search`, etc. See [`docs/mcp.md`](docs/mcp.md) for the full tool
-reference.
+files changed since (every result carries `freshness`; ADR-0020). See
+[`docs/mcp.md`](docs/mcp.md) for the full tool reference.
+
+**Recommended agent loop** (also sent as the server's `instructions`):
+
+1. **Orient** — `cs_repo_map` (pass `focus` = the files/symbols you're touching).
+2. **Locate** — `cs_find "what the code does"`, or `cs_definition` if you know the name.
+3. **Before editing** — `cs_callers` / `cs_blast_radius` on what you'll change.
+4. **After editing** — `cs_diff_impact` → changed symbols, dependents, and the tests to run.
 
 ## Performance
 
@@ -129,11 +159,28 @@ Measured on a 4-core container (release build) — see [`docs/BENCHMARKS.md`](do
 - On-disk index size is the one PRD target not met (~75% vs. <15%); the cause
   and remediation are documented honestly in the benchmarks doc and ADR-0005.
 
+## Accuracy
+
+Call resolution is measured on annotated multi-file fixtures in all 10 languages
+(`tests/eval/`, 85 call sites incl. same-name methods across classes, module-
+qualified calls, field receivers, trait objects, and std-lib calls that must
+stay unbound) — see [`docs/EVAL.md`](docs/EVAL.md):
+
+| Precision | Recall | F1 |
+|---|---|---|
+| **1.00** | **0.97** | **0.98** |
+
+`find` relevance on 16 behavior-phrased queries over codescope's own source:
+**MRR 0.69, Recall@5 0.88**. Both are regression-gated in `cargo test`; run
+`scripts/eval` for the full report.
+
 ## How it works
 
 ```
-repo → Walker (ignore-aware) → tree-sitter parsers → Symbol/edge extraction
-     → CodeGraph (in-memory, indexed) → redb (embedded, on-disk)
+repo → Walker (ignore-aware, parallel) → tree-sitter parsers → symbols, docs, edge sites
+     → Resolver (owner/receiver/import-aware, abstains when unsure)
+     → CodeGraph (in-memory, indexed) ⇄ redb (embedded, on-disk)
+     → PageRank · BM25F search · diff impact · freshness (stat check + incremental patch)
      → Query API → CLI / JSON / MCP
 ```
 
@@ -142,14 +189,19 @@ repo → Walker (ignore-aware) → tree-sitter parsers → Symbol/edge extractio
   `heuristic`: owner/receiver-aware, import-aware, local receiver-type
   inference, abstains rather than guessing — ADR-0018), with a SCIP precision tier designed in (labeled `precise`).
 - **Storage:** embedded, single-file, memory-mapped redb. No external DB.
-- **Concurrency:** rayon for parallel parsing/extraction.
+- **Concurrency:** rayon for parallel parsing/extraction, resolution and search indexing.
+- **Ranking & search:** personalized PageRank (repo map, summary), BM25F over
+  identifier subtokens + doc comments fused with centrality via RRF (ADR-0015, ADR-0021).
 
 ## Documentation
 
-- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (21 ADRs).
+- **Architecture Decision Records:** [`docs/adr/`](docs/adr/) (22 ADRs).
 - **Domain-Driven Design:** [`docs/ddd/`](docs/ddd/) — ubiquitous language,
   bounded contexts, domain model, services & repositories.
-- **Benchmarks & validation:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+- **Benchmarks & validation:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) ·
+  accuracy report [`docs/EVAL.md`](docs/EVAL.md) (`scripts/eval`).
+- **Releases:** tag `vX.Y.Z` → `.github/workflows/release.yml` builds and
+  publishes binaries for 5 targets (ADR-0022).
 - **Product requirements:** [`plans/codescope.prd`](plans/codescope.prd).
 
 ## Ecosystem

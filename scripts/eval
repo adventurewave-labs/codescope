@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run codescope's accuracy evals and write the reports (ADR-0022).
+#
+#   scripts/eval            # print + write docs/EVAL.md
+#   scripts/eval --check    # print only (CI-friendly; exits non-zero on regression)
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [[ "${1:-}" != "--check" ]]; then
+  export CODESCOPE_EVAL_REPORT="$PWD/docs/EVAL.md"
+fi
+
+echo "== call-resolution accuracy (tests/eval/*)"
+cargo test --release --quiet --test resolution_eval -- --nocapture 2>&1 \
+  | sed -n '/^| Language/,/^test /p' | sed '$d' | grep -v '^\.*$'
+
+echo
+echo "== find relevance (codescope's own source)"
+cargo test --release --quiet --test find_relevance -- --nocapture 2>&1 \
+  | sed -n '/^find relevance/,/MRR/p'
+
+if [[ -n "${CODESCOPE_EVAL_REPORT:-}" ]]; then
+  echo
+  echo "wrote ${CODESCOPE_EVAL_REPORT#$PWD/}"
+fi
