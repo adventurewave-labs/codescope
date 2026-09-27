@@ -144,7 +144,19 @@ pub fn is_test(graph: &CodeGraph, s: &Symbol) -> bool {
         || fname.ends_with("_test.py")
         || fname.ends_with("_test.rs")
         || fname.contains(".test.")
-        || fname.contains(".spec.");
+        || fname.contains(".spec.")
+        || f.starts_with("spec/")
+        || f.contains("/spec/")
+        || fname.ends_with("_spec.rb")
+        || fname.ends_with("_test.rb")
+        || fname.ends_with("Test.java")
+        || fname.ends_with("Tests.java")
+        || fname.ends_with("Test.cs")
+        || fname.ends_with("Tests.cs")
+        || fname.ends_with("_test.c")
+        || fname.ends_with("_test.cc")
+        || fname.ends_with("_test.cpp")
+        || fname.ends_with("_unittest.cc");
     if test_path {
         return s.kind != SymbolKind::Module;
     }
