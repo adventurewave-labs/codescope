@@ -10,6 +10,10 @@
 (const_item name: (identifier) @name) @def.constant
 (static_item name: (identifier) @name) @def.constant
 (mod_item name: (identifier) @name) @def.module
+(function_signature_item name: (identifier) @name) @def.method
+
+; Scopes (not symbols): impl blocks turn inner fns into methods of their type.
+(impl_item) @scope.impl
 
 ; Calls
 (call_expression function: (identifier) @call)

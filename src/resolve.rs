@@ -14,20 +14,74 @@
 use crate::domain::{CodeGraph, Confidence, Edge, EdgeKind, SymbolId, SymbolKind};
 use std::collections::HashMap;
 
+/// What the resolver needs to know about a candidate target.
+struct Cand {
+    id: SymbolId,
+    kind: SymbolKind,
+    file: String,
+    /// File stem (`store` for `src/store.rs`) and parent dir (`store` for
+    /// `pkg/store/x.go`) — module-qualifier matching.
+    stem: String,
+    dir: String,
+    owner: Option<String>,
+}
+
+/// What the resolver needs to know about the edge's source.
+struct Caller<'a> {
+    file: &'a str,
+    owner: Option<&'a str>,
+}
+
+fn stem_and_dir(path: &str) -> (String, String) {
+    let mut parts = path.rsplit('/');
+    let file = parts.next().unwrap_or(path);
+    let stem = file.split('.').next().unwrap_or(file);
+    // `mod.rs` / `__init__.py` / `index.ts` are named by their directory.
+    let dir = parts.next().unwrap_or("").to_string();
+    let stem = if matches!(stem, "mod" | "__init__" | "index" | "lib") && !dir.is_empty() {
+        dir.clone()
+    } else {
+        stem.to_string()
+    };
+    (stem, dir)
+}
+
+fn is_self_qualifier(q: &str) -> bool {
+    matches!(q, "self" | "Self" | "this" | "cls" | "super")
+}
+
 /// Resolve all unresolved edges in place and rebuild indexes.
 pub fn resolve(graph: &mut CodeGraph) {
     // Snapshot the lookups we need (immutable borrow) before mutating edges.
-    let name_index: HashMap<String, Vec<(SymbolId, SymbolKind, String)>> = {
-        let mut m: HashMap<String, Vec<(SymbolId, SymbolKind, String)>> = HashMap::new();
-        for s in graph.symbols() {
-            m.entry(s.name.clone())
-                .or_default()
-                .push((s.id, s.kind, s.file.clone()));
+    let mut name_index: HashMap<&str, Vec<Cand>> = HashMap::new();
+    for s in graph.symbols() {
+        let (stem, dir) = stem_and_dir(&s.file);
+        name_index.entry(s.name.as_str()).or_default().push(Cand {
+            id: s.id,
+            kind: s.kind,
+            file: s.file.clone(),
+            stem,
+            dir,
+            owner: s.owner.clone(),
+        });
+    }
+    // Deterministic candidate order → deterministic tie-breaking.
+    for v in name_index.values_mut() {
+        v.sort_by_key(|c| c.id);
+    }
+
+    // Per-file import strings (for import-aware scoring).
+    let mut imports: HashMap<&str, Vec<&str>> = HashMap::new();
+    for e in graph.edges() {
+        if e.kind == EdgeKind::Imports {
+            if let Some(s) = graph.symbol(e.from) {
+                imports
+                    .entry(s.file.as_str())
+                    .or_default()
+                    .push(e.to_name.as_str());
+            }
         }
-        m
-    };
-    let file_of: HashMap<SymbolId, String> =
-        graph.symbols().map(|s| (s.id, s.file.clone())).collect();
+    }
 
     let mut resolved: Vec<Edge> = Vec::with_capacity(graph.edge_count());
     for edge in graph.edges() {
@@ -35,11 +89,22 @@ pub fn resolve(graph: &mut CodeGraph) {
             resolved.push(edge.clone());
             continue;
         }
-        let target = resolve_one(edge, &name_index, &file_of);
         let mut e = edge.clone();
-        if let Some(to) = target {
-            e.to = Some(to);
-            e.confidence = Confidence::Heuristic;
+        if let Some(src) = graph.symbol(edge.from) {
+            let caller = Caller {
+                file: &src.file,
+                owner: src.owner.as_deref(),
+            };
+            let file_imports = imports
+                .get(src.file.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            if let Some((to, alternatives)) = resolve_one(edge, &caller, file_imports, &name_index)
+            {
+                e.to = Some(to);
+                e.alternatives = alternatives;
+                e.confidence = Confidence::Heuristic;
+            }
         }
         resolved.push(e);
     }
@@ -48,11 +113,40 @@ pub fn resolve(graph: &mut CodeGraph) {
     graph.reindex();
 }
 
+/// How strongly an import string refers to the candidate's module: 3 when it
+/// names the file's module (`pkg.beta`, `crate::store`), 2 when it only names
+/// the package directory (Go-style `".../store"`), 0 otherwise.
+fn import_score(import: &str, c: &Cand) -> u32 {
+    let mut best = 0;
+    for seg in import
+        .split([':', '.', '/', '{', '}', ',', ' ', '"', '\''])
+        .filter(|s| !s.is_empty())
+    {
+        if seg == c.stem {
+            return 3;
+        }
+        if !c.dir.is_empty() && seg == c.dir {
+            best = 2;
+        }
+    }
+    best
+}
+
+/// Score candidates and return the best `(target, tied_alternatives)`.
+///
+/// Scoring (higher wins; ADR-0018):
+/// * owner match — `self.m()` in a method of `T` → `T::m`; `T::m()` → owner `T`: **+16**
+/// * module qualifier — `store::open()` / `store.open()` → a symbol in `store.*`: **+8**
+/// * same file: **+4**
+/// * caller's file imports the candidate's module: **+3** (package dir only: **+2**)
+/// * bare call `f()` → a free function (no owner): **+2**
+/// * base: **+1**
 fn resolve_one(
     edge: &Edge,
-    name_index: &HashMap<String, Vec<(SymbolId, SymbolKind, String)>>,
-    file_of: &HashMap<SymbolId, String>,
-) -> Option<SymbolId> {
+    caller: &Caller,
+    file_imports: &[&str],
+    name_index: &HashMap<&str, Vec<Cand>>,
+) -> Option<(SymbolId, u16)> {
     // The callee/reference name may be a path tail; match on the last segment.
     let name = edge
         .to_name
@@ -60,29 +154,88 @@ fn resolve_one(
         .next()
         .and_then(|s| s.rsplit('.').next())
         .unwrap_or(&edge.to_name);
-
     let candidates = name_index.get(name)?;
-    let want_callable = edge.kind == EdgeKind::Calls;
+    let want_callable = matches!(edge.kind, EdgeKind::Calls | EdgeKind::Defines);
+    let q = edge.qualifier.as_deref();
 
-    let from_file = file_of.get(&edge.from);
-
-    let mut best: Option<(SymbolId, u8)> = None; // (id, score) higher score better
-    for (id, kind, file) in candidates {
-        if *id == edge.from {
+    let mut best: Option<(SymbolId, u32)> = None;
+    let mut ties: u16 = 0;
+    for c in candidates {
+        if c.id == edge.from {
             continue; // never self-resolve
         }
-        if want_callable && !kind.is_callable() {
+        if want_callable && !c.kind.is_callable() {
             continue;
         }
-        let same_file = from_file.map(|f| f == file).unwrap_or(false);
-        let score = if same_file { 2 } else { 1 };
+        if edge.kind == EdgeKind::Defines && c.owner.as_deref() != q {
+            continue; // a trait impl binds only to the trait's own method
+        }
+        let mut score = 1u32;
+        match q {
+            Some(q) if is_self_qualifier(q) => {
+                if c.owner.is_some() && c.owner.as_deref() == caller.owner {
+                    score += 16;
+                }
+            }
+            Some(q) => {
+                if c.owner.as_deref() == Some(q) {
+                    score += 16;
+                } else if q == c.stem || q == c.dir {
+                    score += 8;
+                }
+            }
+            None => {
+                if c.owner.is_none() {
+                    score += 2;
+                }
+            }
+        }
+        if c.file == caller.file {
+            score += 4;
+        }
+        score += file_imports
+            .iter()
+            .map(|i| import_score(i, c))
+            .max()
+            .unwrap_or(0);
         match best {
-            Some((bid, bscore)) if bscore > score || (bscore == score && bid <= *id) => {}
-            _ => best = Some((*id, score)),
+            Some((_, b)) if b > score => {}
+            Some((_, b)) if b == score => ties += 1,
+            _ => {
+                best = Some((c.id, score));
+                ties = 0;
+            }
         }
     }
-    best.map(|(id, _)| id)
+    // A call through an arbitrary variable (`items.push(x)`) with no
+    // supporting evidence — not same-file, not imported, no owner/module
+    // match — is far more likely a std/third-party method than whichever repo
+    // method shares the name. Leave it unresolved rather than invent an edge.
+    // Uppercase qualifier that is a *type* (owns methods somewhere) vs. a
+    // module-ish name; only method candidates make it a typed receiver.
+    let typed_receiver = q.is_some_and(|q| {
+        q.starts_with(|c: char| c.is_ascii_uppercase())
+            && !is_self_qualifier(q)
+            && candidates.iter().any(|c| c.owner.is_some())
+    });
+    let receiver_is_variable = q.is_some_and(|q| {
+        !is_self_qualifier(q) && q.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+    });
+    match best {
+        Some((_, score)) if receiver_is_variable && score < MIN_RECEIVER_SCORE => None,
+        // A typed receiver (`Vec`, `String`, an external type) whose type owns
+        // none of the candidates: the method lives outside the repo.
+        Some((_, score)) if typed_receiver && score < 16 && edge.kind == EdgeKind::Calls => None,
+        Some((id, _)) => Some((id, ties)),
+        None => None,
+    }
 }
+
+/// Minimum evidence (see scoring table) to bind a call through a receiver
+/// whose type could not be inferred: a module-qualifier match or better.
+/// (Receivers with an inferred type carry that type as the qualifier and
+/// bind via the owner rule instead.)
+const MIN_RECEIVER_SCORE: u32 = 9;
 
 #[cfg(test)]
 mod tests {
@@ -123,5 +276,179 @@ mod tests {
             .unwrap();
         let target = call.to.expect("cross-file call resolves");
         assert_eq!(g.symbol(target).unwrap().file, "a.rs");
+    }
+
+    fn graph(files: &[(&str, &str)]) -> CodeGraph {
+        let mut g = CodeGraph::new();
+        for (p, src) in files {
+            let lang = Language::from_path(std::path::Path::new(p)).unwrap();
+            g.upsert_file(extract(lang, p, src, 0));
+        }
+        g.reindex();
+        resolve(&mut g);
+        g
+    }
+
+    fn target_of<'a>(
+        g: &'a CodeGraph,
+        caller: &str,
+        callee: &str,
+    ) -> Option<&'a crate::domain::Symbol> {
+        let from = g
+            .symbols()
+            .find(|s| s.name == caller && s.kind.is_callable())?
+            .id;
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == callee)?;
+        g.symbol(e.to?)
+    }
+
+    #[test]
+    fn rust_self_call_binds_to_own_impl() {
+        let g = graph(&[
+            ("a.rs", "struct A;\nimpl A {\n    fn run(&self) { self.step(); }\n    fn step(&self) {}\n}\n"),
+            ("b.rs", "struct B;\nimpl B {\n    fn step(&self) {}\n}\n"),
+        ]);
+        let t = target_of(&g, "run", "step").unwrap();
+        assert_eq!(t.owner.as_deref(), Some("A"));
+        assert_eq!(t.kind, SymbolKind::Method);
+    }
+
+    #[test]
+    fn type_qualified_call_binds_to_owner() {
+        // The same-file `new` would win on locality alone; `B::new` must win on owner.
+        let g = graph(&[
+            (
+                "a.rs",
+                "struct A;\nimpl A { fn new() -> A { A } }\nfn make() { B::new(); }\n",
+            ),
+            (
+                "b.rs",
+                "pub struct B;\nimpl B { pub fn new() -> B { B } }\n",
+            ),
+        ]);
+        let t = target_of(&g, "make", "new").unwrap();
+        assert_eq!(t.owner.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn module_qualified_call_binds_to_module() {
+        let g = graph(&[
+            ("src/store.rs", "pub fn open() {}\n"),
+            ("src/walker.rs", "pub fn open() {}\n"),
+            ("src/main.rs", "fn main() { store::open(); }\n"),
+        ]);
+        assert_eq!(target_of(&g, "main", "open").unwrap().file, "src/store.rs");
+    }
+
+    #[test]
+    fn imports_break_cross_file_ties() {
+        let g = graph(&[
+            ("pkg/alpha.py", "def helper():\n    pass\n"),
+            ("pkg/beta.py", "def helper():\n    pass\n"),
+            (
+                "app.py",
+                "from pkg.beta import helper\n\ndef run():\n    helper()\n",
+            ),
+        ]);
+        let t = target_of(&g, "run", "helper").unwrap();
+        assert_eq!(t.file, "pkg/beta.py");
+    }
+
+    #[test]
+    fn unrelated_variable_receiver_stays_unbound() {
+        // `v.push(1)` on some Vec must not bind to an unrelated repo method.
+        let g = graph(&[
+            (
+                "budget.rs",
+                "struct Budget;\nimpl Budget { fn push(&mut self) {} }\n",
+            ),
+            (
+                "other.rs",
+                "fn fill() { let mut v = Vec::new(); v.push(1); }\n",
+            ),
+        ]);
+        let from = g.by_name("fill")[0];
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "push")
+            .unwrap();
+        assert!(e.to.is_none());
+        // …same file is not enough evidence either…
+        let g = graph(&[(
+            "budget.rs",
+            "struct Budget;\nimpl Budget { fn push(&mut self) {} }\nfn fill(v: Vec<u8>) { v.push(1); }\n",
+        )]);
+        assert!(target_of(&g, "fill", "push").is_none());
+        // …but an inferred receiver type binds it precisely, even cross-file.
+        let g = graph(&[
+            (
+                "budget.rs",
+                "pub struct Budget;\nimpl Budget { pub fn push(&mut self) {} }\n",
+            ),
+            ("user.rs", "fn fill(b: &mut Budget) { b.push(); }\n"),
+        ]);
+        assert_eq!(
+            target_of(&g, "fill", "push").unwrap().owner.as_deref(),
+            Some("Budget")
+        );
+    }
+
+    #[test]
+    fn ambiguity_is_counted() {
+        let g = graph(&[
+            ("x.rs", "pub fn dup() {}\n"),
+            ("y.rs", "pub fn dup() {}\n"),
+            ("z.rs", "fn caller() { dup(); }\n"),
+        ]);
+        let from = g.by_name("caller")[0];
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Calls)
+            .unwrap();
+        assert!(e.to.is_some());
+        assert_eq!(e.alternatives, 1);
+    }
+
+    #[test]
+    fn trait_impl_defines_trait_method() {
+        let g = graph(&[
+            ("t.rs", "pub trait Shape {\n    fn area(&self) -> f64;\n}\n"),
+            (
+                "c.rs",
+                "struct Circle;\nimpl Shape for Circle {\n    fn area(&self) -> f64 { 1.0 }\n}\n",
+            ),
+        ]);
+        let imp = g
+            .symbols()
+            .find(|s| s.name == "area" && s.owner.as_deref() == Some("Circle"))
+            .unwrap();
+        let def = g
+            .out_edges(imp.id)
+            .find(|e| e.kind == EdgeKind::Defines)
+            .unwrap();
+        let tr = g.symbol(def.to.unwrap()).unwrap();
+        assert_eq!(tr.owner.as_deref(), Some("Shape"));
+        assert_eq!(tr.file, "t.rs");
+    }
+
+    #[test]
+    fn python_and_go_methods_get_owners() {
+        let g = graph(&[
+            ("m.py", "class Repo:\n    def save(self):\n        self.flush()\n    def flush(self):\n        pass\n"),
+            ("s.go", "package s\ntype Server struct{}\nfunc (s *Server) Start() { s.listen() }\nfunc (s *Server) listen() {}\n"),
+        ]);
+        let save = g.symbols().find(|s| s.name == "save").unwrap();
+        assert_eq!(
+            (save.kind, save.owner.as_deref()),
+            (SymbolKind::Method, Some("Repo"))
+        );
+        assert_eq!(
+            target_of(&g, "save", "flush").unwrap().owner.as_deref(),
+            Some("Repo")
+        );
+        let start = g.symbols().find(|s| s.name == "Start").unwrap();
+        assert_eq!(start.owner.as_deref(), Some("Server"));
     }
 }
