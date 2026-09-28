@@ -10,6 +10,13 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Dry run: any PR touching the release pipeline or the build inputs runs
+  # verify + the full 5-target build + smoke tests, but never publishes.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
     inputs:
       tag:
@@ -42,11 +49,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl,  archive: tar.gz }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, archive: tar.gz }
-          - { os: macos-14,         target: aarch64-apple-darwin,       archive: tar.gz }
-          - { os: macos-13,         target: x86_64-apple-darwin,        archive: tar.gz }
-          - { os: windows-latest,   target: x86_64-pc-windows-msvc,     archive: zip }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl,  archive: tar.gz, run: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, archive: tar.gz, run: true }
+          - { os: macos-14,         target: aarch64-apple-darwin,       archive: tar.gz, run: true }
+          # Intel macOS runners are being retired: cross-compile on Apple
+          # silicon; the smoke step verifies the Mach-O arch instead of running.
+          - { os: macos-14,         target: x86_64-apple-darwin,        archive: tar.gz, run: false }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,     archive: zip,    run: true }
     steps:
       - uses: actions/checkout@v4
 
@@ -67,15 +76,21 @@ jobs:
         run: |
           bin=target/${{ matrix.target }}/release/codescope
           [[ -f "$bin.exe" ]] && bin="$bin.exe"
-          "$bin" --version
-          "$bin" -p . index
-          "$bin" -p . find "parse unified diff" --max-tokens 200
+          if [[ "${{ matrix.run }}" == "true" ]]; then
+            "$bin" --version
+            "$bin" -p . index
+            "$bin" -p . find "parse unified diff" --max-tokens 200 | tee find.out
+            grep -q parse_unified_diff find.out
+          else
+            file "$bin"
+            file "$bin" | grep -q "x86_64"
+          fi
 
       - name: Package
         id: pkg
         shell: bash
         run: |
-          ref="${{ github.event.inputs.tag || github.ref_name }}"
+          ref="${{ github.event.inputs.tag || (github.event_name == 'pull_request' && 'dryrun') || github.ref_name }}"
           name="codescope-${ref}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           if [[ "${{ matrix.os }}" == windows-* ]]; then
@@ -109,6 +124,7 @@ jobs:
   publish:
     name: publish GitHub Release
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,5 +142,8 @@ jobs:
           if gh release view "$tag" > /dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
           else
-            gh release create "$tag" dist/* --title "codescope $tag" --generate-notes
+            # Tags with a suffix (v0.3.0-rc.1) publish as pre-releases.
+            pre=""
+            [[ "$tag" == *-* ]] && pre="--prerelease"
+            gh release create "$tag" dist/* --title "codescope $tag" --generate-notes $pre
           fi
