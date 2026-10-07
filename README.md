@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/banner.svg" alt="codescope — animated banner" width="100%"></p>
+
 # codescope
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](#license)
