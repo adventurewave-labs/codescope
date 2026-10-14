@@ -652,6 +652,21 @@ fn resolve_import(
     }
 
     let qualified = segments.len() > 1;
+    // Whether BOTH crate-root files exist under the caller's crate prefix:
+    // a module file's crate ownership (library vs binary) is then unknowable
+    // without `mod` declarations, and root-file bindings must abstain.
+    let both_roots = if qualified && caller.language == Language::Rust {
+        let pref = crate_root_prefix(caller.file).join("/");
+        let has_root = |n: &str| {
+            by_basename.get(n).is_some_and(|v| {
+                v.iter()
+                    .any(|c| pref.is_empty() || c.file.starts_with(&format!("{pref}/")))
+            })
+        };
+        has_root("lib.rs") && has_root("main.rs")
+    } else {
+        false
+    };
     if qualified
         && caller.language == Language::Rust
         && matches!(
@@ -670,7 +685,7 @@ fn resolve_import(
             continue;
         }
         if qualified {
-            if !proven_for_candidate(eff, &segments, c, caller) {
+            if !proven_for_candidate(eff, &segments, c, caller, both_roots) {
                 continue;
             }
         } else if c.kind != SymbolKind::Module {
@@ -773,7 +788,13 @@ fn module_segments(path: &str, lang: Option<Language>) -> Vec<String> {
 ///   suffix of the candidate's directory — `app.store.Repo` passes for
 ///   `app/store/Repo.java`, while `java.util.List` fails even beside a
 ///   `java/` directory (there is no `java/util` chain above the candidate).
-fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller) -> bool {
+fn proven_for_candidate(
+    raw: &str,
+    segments: &[&str],
+    c: &Cand,
+    caller: &Caller,
+    both_roots: bool,
+) -> bool {
     let name = segments[segments.len() - 1];
     let mut parent: Vec<String> = segments[..segments.len() - 1]
         .iter()
@@ -821,7 +842,14 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         if bare && caller.language == Language::Rust {
             let caller_base = caller.file.rsplit(['/', '\\']).next().unwrap_or("");
             if matches!(caller_base, "lib.rs" | "main.rs") {
-                return c.file == caller.file;
+                // Own items, or a direct child module (`use self::child;`).
+                let prefix = crate_root_prefix(caller.file);
+                let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+                let csegs = candidate_segments(c);
+                return c.file == caller.file
+                    || (c.kind == SymbolKind::Module
+                        && csegs.starts_with(&prefix[..])
+                        && csegs.len() == pref.len() + 1);
             }
         }
         // Keep any remaining path (`super::child::B` from `src/a/x.rs` is
@@ -844,19 +872,19 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
             return false; // another crate's tree (workspace sibling)
         }
         // The binary (main.rs) and library (lib.rs) are separate crates:
-        // a `crate::` import binds only the caller's OWN root file.
-        let caller_root = if caller
-            .file
-            .rsplit(['/', '\\'])
-            .next()
-            .is_some_and(|f| f == "main.rs")
-        {
+        // a `crate::` import binds only the caller's OWN root file — and a
+        // module file that is not a root itself abstains when both roots
+        // exist (its crate ownership is unknowable).
+        let caller_base = caller.file.rsplit(['/', '\\']).next().unwrap_or("");
+        let ambiguous_owner = both_roots && !matches!(caller_base, "lib.rs" | "main.rs");
+        let caller_root = if caller_base == "main.rs" {
             "main.rs"
         } else {
             "lib.rs"
         };
         let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
-        if root_file == caller_root
+        if !ambiguous_owner
+            && root_file == caller_root
             && csegs.starts_with(&prefix[..])
             && csegs.len() <= pref.len() + 1
         {
@@ -2179,6 +2207,50 @@ mod tests {
             .symbol(e.to.expect("self::child binds src/child.rs"))
             .unwrap();
         assert_eq!(target.file, "src/child.rs");
+    }
+
+    #[test]
+    fn bare_self_import_from_root_binds_child_module() {
+        // `use self::child;` from src/main.rs imports the child module
+        // itself (not an item of the sibling library root).
+        let g = graph(&[
+            (
+                "src/main.rs",
+                "use self::child;\nfn main() { let _m: child::Thing; }\n",
+            ),
+            ("src/child.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("self::child binds src/child.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/child.rs");
+        assert_eq!(target.kind, SymbolKind::Module);
+    }
+
+    #[test]
+    fn crate_import_from_module_abstains_when_both_roots_exist() {
+        // With lib.rs AND main.rs both present, a module file's crate
+        // ownership is unknowable: `crate::B` from src/child.rs abstains
+        // rather than guessing the library root.
+        let g = graph(&[
+            ("src/child.rs", "use crate::B;\nfn run() { let _b: B; }\n"),
+            ("src/lib.rs", "pub struct B;\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "crate::B from a module file must abstain when both roots exist"
+        );
     }
 
     #[test]
