@@ -625,7 +625,25 @@ fn resolve_import(
             if c.kind != SymbolKind::Module {
                 continue; // a relative path names a file/module, not a symbol
             }
-            if candidate_segments(c) != target {
+            // Accept the module identity OR the explicit entry-file path
+            // (`./b/index` names b/index.ts, whose module identity
+            // collapses to `b`).
+            let remapped = candidate_segments(c);
+            let mut raw: Vec<String> = c
+                .file
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            raw.pop();
+            if let Some(fname) = c.file.rsplit(['/', '\\']).next() {
+                let stem = match fname.rsplit_once('.') {
+                    Some((s, e)) if is_code_extension(e) => s.to_string(),
+                    _ => fname.split('.').next().unwrap_or(fname).to_string(),
+                };
+                raw.push(stem);
+            }
+            if remapped != target && raw != target {
                 continue;
             }
             // `./b` prefers the FILE b.ts over the directory module
@@ -658,10 +676,14 @@ fn resolve_import(
     let (has_lib, has_main) = if qualified && caller.language == Language::Rust {
         let pref = crate_root_prefix(caller.file).join("/");
         let has_root = |n: &str| {
-            by_basename.get(n).is_some_and(|v| {
-                v.iter()
-                    .any(|c| pref.is_empty() || c.file.starts_with(&format!("{pref}/")))
-            })
+            let want = if pref.is_empty() {
+                n.to_string()
+            } else {
+                format!("{pref}/{n}")
+            };
+            by_basename
+                .get(n)
+                .is_some_and(|v| v.iter().any(|c| c.file == want))
         };
         (has_root("lib.rs"), has_root("main.rs"))
     } else {
@@ -2348,6 +2370,43 @@ mod tests {
             .find(|e| e.kind == EdgeKind::Imports)
             .unwrap();
         let target = g.symbol(e.to.expect("the single root binds")).unwrap();
+        assert_eq!(target.file, "src/main.rs");
+    }
+
+    #[test]
+    fn explicit_entry_file_import_binds() {
+        // `./b/index` names b/index.ts explicitly.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b/index\";\nexport function a() { return b(); }\n",
+            ),
+            ("b/index.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("./b/index binds b/index.ts")).unwrap();
+        assert_eq!(target.file, "b/index.ts");
+    }
+
+    #[test]
+    fn nested_lib_does_not_make_ownership_ambiguous() {
+        // src/nested/lib.rs is not the caller's crate root: with only
+        // src/main.rs at the root, crate::B from a module file binds it.
+        let g = graph(&[
+            ("src/child.rs", "use crate::B;\nfn run() { let _b: B; }\n"),
+            ("src/main.rs", "pub struct B;\nfn main() {}\n"),
+            ("src/nested/lib.rs", "pub mod x { pub struct Noop; }\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("the real root binds")).unwrap();
         assert_eq!(target.file, "src/main.rs");
     }
 
