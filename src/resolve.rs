@@ -655,7 +655,7 @@ fn resolve_import(
     // Whether BOTH crate-root files exist under the caller's crate prefix:
     // a module file's crate ownership (library vs binary) is then unknowable
     // without `mod` declarations, and root-file bindings must abstain.
-    let both_roots = if qualified && caller.language == Language::Rust {
+    let (has_lib, has_main) = if qualified && caller.language == Language::Rust {
         let pref = crate_root_prefix(caller.file).join("/");
         let has_root = |n: &str| {
             by_basename.get(n).is_some_and(|v| {
@@ -663,9 +663,9 @@ fn resolve_import(
                     .any(|c| pref.is_empty() || c.file.starts_with(&format!("{pref}/")))
             })
         };
-        has_root("lib.rs") && has_root("main.rs")
+        (has_root("lib.rs"), has_root("main.rs"))
     } else {
-        false
+        (false, false)
     };
     if qualified
         && caller.language == Language::Rust
@@ -685,7 +685,7 @@ fn resolve_import(
             continue;
         }
         if qualified {
-            if !proven_for_candidate(eff, &segments, c, caller, both_roots) {
+            if !proven_for_candidate(eff, &segments, c, caller, has_lib, has_main) {
                 continue;
             }
         } else if c.kind != SymbolKind::Module {
@@ -793,7 +793,8 @@ fn proven_for_candidate(
     segments: &[&str],
     c: &Cand,
     caller: &Caller,
-    both_roots: bool,
+    has_lib: bool,
+    has_main: bool,
 ) -> bool {
     let name = segments[segments.len() - 1];
     let mut parent: Vec<String> = segments[..segments.len() - 1]
@@ -872,21 +873,30 @@ fn proven_for_candidate(
             return false; // another crate's tree (workspace sibling)
         }
         // The binary (main.rs) and library (lib.rs) are separate crates:
-        // a `crate::` import binds only the caller's OWN root file — and a
-        // module file that is not a root itself abstains when both roots
-        // exist (its crate ownership is unknowable).
+        // a `crate::` import binds only the caller's OWN root file — exactly
+        // at the crate prefix (a nested `src/nested/lib.rs` is that nested
+        // module's root, not the caller's). A module file abstains when both
+        // roots exist (its crate ownership is unknowable), and binds the one
+        // available root otherwise.
         let caller_base = caller.file.rsplit(['/', '\\']).next().unwrap_or("");
-        let ambiguous_owner = both_roots && !matches!(caller_base, "lib.rs" | "main.rs");
-        let caller_root = if caller_base == "main.rs" {
-            "main.rs"
-        } else {
-            "lib.rs"
+        let (want_root, ambiguous_owner) = match caller_base {
+            "lib.rs" => (Some("lib.rs"), false),
+            "main.rs" => (Some("main.rs"), false),
+            _ if has_lib && has_main => (None, true),
+            _ => (
+                if has_lib {
+                    Some("lib.rs")
+                } else {
+                    Some("main.rs")
+                },
+                false,
+            ),
         };
         let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
         if !ambiguous_owner
-            && root_file == caller_root
+            && want_root.is_some_and(|w| root_file == w)
             && csegs.starts_with(&prefix[..])
-            && csegs.len() <= pref.len() + 1
+            && csegs.len() == prefix.len()
         {
             return true;
         }
@@ -2251,6 +2261,39 @@ mod tests {
             e.to.is_none(),
             "crate::B from a module file must abstain when both roots exist"
         );
+    }
+
+    #[test]
+    fn binary_only_tree_binds_its_root() {
+        // No lib.rs at all: `crate::B` from a module of the binary crate
+        // binds main.rs's B.
+        let g = graph(&[
+            ("src/child.rs", "use crate::B;\nfn run() { let _b: B; }\n"),
+            ("src/main.rs", "pub struct B;\nfn main() {}\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("the only root binds")).unwrap();
+        assert_eq!(target.file, "src/main.rs");
+    }
+
+    #[test]
+    fn nested_lib_rs_is_not_the_callers_root() {
+        // `crate::B` from src/x.rs must not bind a B in src/nested/lib.rs —
+        // that lib.rs is the nested module's root.
+        let g = graph(&[
+            ("src/x.rs", "use crate::B;\nfn run() { let _b: B; }\n"),
+            ("src/nested/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "nested lib.rs is not the crate root");
     }
 
     #[test]
