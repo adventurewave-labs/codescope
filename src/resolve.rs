@@ -602,10 +602,11 @@ fn resolve_import(
         .get(name)
         .map(|v| v.iter().collect())
         .unwrap_or_default();
-    if relative {
-        // A relative path may target a directory module (`./b` →
-        // b/index.ts), whose module symbol is named by the directory — the
-        // path comparison below does the filtering.
+    if relative || (segments.len() > 1 && !eff.contains("::")) {
+        // A relative path or dotted package may target a directory module
+        // (`./b` → b/index.ts, `import pkg.sub` → pkg/sub/__init__.py),
+        // whose module symbol keeps the entry-file's name — the path
+        // evidence below does the filtering.
         for alt in ["index", "__init__", "mod"] {
             if let Some(v) = name_index.get(alt) {
                 cand_vec.extend(v.iter());
@@ -976,6 +977,11 @@ fn proven_for_candidate(
         // module candidate may match it — otherwise `use crate::a::B` could
         // bind a struct `B` in `src/a/B.rs`.
         let chain_match = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
+        // A caller-relative scope is absolute within the caller's tree: a
+        // same-suffix path in an unrelated workspace crate must not match.
+        if caller_relative {
+            return csegs == parent[..] || (chain_match && csegs == chain[..]);
+        }
         // A crate-rooted path anchors at the CALLER's crate root (the last
         // `src` directory — workspaces nest crates under crates/foo/src):
         // the candidate's path must be exactly the root prefix plus the
@@ -1016,7 +1022,13 @@ fn proven_for_candidate(
             .split('.')
             .next()
             .unwrap_or("");
+        let mut chain: Vec<&str> = parent.to_vec();
+        chain.push(name);
+        // A directory package (`import pkg.sub` → pkg/sub/__init__.py, whose
+        // module identity is [pkg, sub]) matches the full imported chain.
+        let package_match = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
         csegs.ends_with(&parent[..])
+            || package_match
             || (csegs.len() > parent.len()
                 && csegs[..csegs.len() - 1].ends_with(&parent[..])
                 && stem == name)
@@ -2435,6 +2447,43 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("the real root binds")).unwrap();
         assert_eq!(target.file, "src/main.rs");
+    }
+
+    #[test]
+    fn caller_relative_scope_is_exact() {
+        // `self::child::B` from src/a.rs must not bind a same-suffix path in
+        // an unrelated tree when the local target is absent.
+        let g = graph(&[
+            ("src/a.rs", "use self::child::B;\nfn run() { let _b: B; }\n"),
+            ("vendor/other/src/a/child.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/a.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "self::child::B must not bind vendor/other/src/a/child.rs"
+        );
+    }
+
+    #[test]
+    fn python_dotted_import_binds_directory_package() {
+        // `import pkg.sub` resolves the package pkg/sub (__init__.py), whose
+        // module identity is [pkg, sub].
+        let g = graph(&[
+            ("pkg/sub/__init__.py", "\n"),
+            ("app.py", "import pkg.sub\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("pkg.sub binds the package")).unwrap();
+        assert_eq!(target.file, "pkg/sub/__init__.py");
+        assert_eq!(target.kind, SymbolKind::Module);
     }
 
     #[test]
