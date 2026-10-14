@@ -720,8 +720,17 @@ fn resolve_import(
             {
                 continue;
             }
-        } else if c.kind != SymbolKind::Module {
-            continue; // a bare import names a module, never a function
+        } else {
+            // A bare import names a module — never a function — and an
+            // entry-file candidate (pkg/__init__.py) qualifies only when
+            // its module identity IS the imported name (`import pkg`), so
+            // `import time` cannot bind an arbitrary package.
+            if c.kind != SymbolKind::Module {
+                continue;
+            }
+            if candidate_segments(c).last().is_some_and(|s| s != name) {
+                continue;
+            }
         }
         let mut score = 1;
         if c.kind == SymbolKind::Module {
@@ -2547,6 +2556,25 @@ mod tests {
             .unwrap();
         assert_eq!(target.file, "pkg/__init__.py");
         assert_eq!(target.kind, SymbolKind::Module);
+    }
+
+    #[test]
+    fn bare_import_does_not_bind_arbitrary_packages() {
+        // `import time` must stay unbound even when an unrelated package
+        // (__init__.py module) is in the candidate set.
+        let g = graph(&[
+            ("pkg/__init__.py", "\n"),
+            ("app.py", "import time\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import time must not bind the unrelated pkg package"
+        );
     }
 
     #[test]
