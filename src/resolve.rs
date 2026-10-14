@@ -420,9 +420,11 @@ fn lang_family(lang: Language) -> u8 {
     }
 }
 
-/// The parent-directory segment of a path (`py` for `py/a.py`).
-fn dir_of(path: &str) -> &str {
-    path.rsplit(['/', '\\']).nth(1).unwrap_or("")
+/// The full parent path of a file (`py/sub` for `py/sub/a.py`, "" at the
+/// root) — directory affinity must compare whole paths, not just the final
+/// segment, or `app/include/` and `vendor/include/` look alike.
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once(['/', '\\']).map(|(d, _)| d).unwrap_or("")
 }
 
 /// Bind an `Imports` edge to the module symbol of the file it names.
@@ -511,8 +513,7 @@ fn resolve_import(
                 // A multi-component include (`sub/b.h`, `../sub/b.h`) must
                 // honor its path: a file at that exact suffix beats a
                 // same-basename file in the importer's directory. `c.dir` is
-                // the last directory segment — see `stem_and_dir`; `dir_of`
-                // mirrors that contract.
+                // the full parent path — see `parent_path`.
                 // Normalize away `.`/`..` components so `../sub/b.h` competes
                 // on its real path.
                 let full: String = eff
@@ -522,8 +523,9 @@ fn resolve_import(
                     .join("/");
                 let on_path =
                     c.file == full || (full.contains('/') && c.file.ends_with(&format!("/{full}")));
-                let score =
-                    1 + u32::from(on_path) * 32 + u32::from(c.dir == dir_of(caller.file)) * 8;
+                let score = 1
+                    + u32::from(on_path) * 32
+                    + u32::from(parent_path(&c.file) == parent_path(caller.file)) * 8;
                 match best {
                     Some((_, b)) if b > score => {}
                     Some((_, b)) if b == score => ties += 1,
@@ -613,7 +615,7 @@ fn resolve_import(
         if c.kind == SymbolKind::Module {
             score += 6; // an import names a module first, a symbol second
         }
-        if c.dir == dir_of(caller.file) {
+        if parent_path(&c.file) == parent_path(caller.file) {
             score += 4; // relative imports resolve against the importer's dir
         }
         if c.file == caller.file {
@@ -743,11 +745,17 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
     }
 
     if parent.is_empty() {
-        // `crate::B` names the crate ROOT: only a symbol living in a
-        // crate-root file (src/lib.rs, src/main.rs) qualifies — not a
-        // namesake in an unrelated module.
+        // An empty scope is the crate root. A *symbol* import (`crate::B`)
+        // binds only a symbol in a crate-root file (src/lib.rs,
+        // src/main.rs) — not a namesake in an unrelated module. A *module*
+        // import (`use crate::a;`) binds the module named by the final
+        // segment (src/a.rs).
         let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
-        return matches!(root_file, "lib.rs" | "main.rs");
+        if matches!(root_file, "lib.rs" | "main.rs") {
+            return true;
+        }
+        return c.kind == SymbolKind::Module
+            && candidate_segments(c).ends_with(&[name.to_string()]);
     }
     let parent: Vec<&str> = parent.iter().map(|s| s.as_str()).collect();
     let csegs = candidate_segments(c);
@@ -1594,6 +1602,48 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("crate::B binds the root B")).unwrap();
         assert_eq!(target.file, "src/lib.rs");
+    }
+
+    #[test]
+    fn root_level_module_import_binds() {
+        // `use crate::a;` imports the root-level module src/a.rs — not a
+        // symbol at the crate root.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a;\nfn main() { let _m: a::Thing; }\n",
+            ),
+            ("src/a.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("crate::a binds src/a.rs")).unwrap();
+        assert_eq!(target.file, "src/a.rs");
+    }
+
+    #[test]
+    fn duplicate_directory_basenames_do_not_confuse_affinity() {
+        // app/include/ and vendor/include/ share their final segment; the
+        // include from app/include must bind app's header, not whichever
+        // file got the lower symbol id.
+        let g = graph(&[
+            ("app/include/head.h", "int app_head(void);\n"),
+            ("vendor/include/head.h", "int vendor_head(void);\n"),
+            (
+                "app/include/main.c",
+                "#include \"head.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "app/include/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "head.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("same full directory wins")).unwrap();
+        assert_eq!(target.file, "app/include/head.h");
     }
 
     #[test]
