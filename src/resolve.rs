@@ -735,11 +735,19 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         if caller_segs.is_empty() {
             return false;
         }
-        parent = caller_segs;
+        // Keep any remaining path (`super::child::B` from `src/a/x.rs` is
+        // `src/a/child`, not merely `src/a`).
+        let mut scope = caller_segs;
+        scope.append(&mut parent);
+        parent = scope;
     }
 
     if parent.is_empty() {
-        return true; // `crate::resolve` — proven, module named outright
+        // `crate::B` names the crate ROOT: only a symbol living in a
+        // crate-root file (src/lib.rs, src/main.rs) qualifies — not a
+        // namesake in an unrelated module.
+        let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
+        return matches!(root_file, "lib.rs" | "main.rs");
     }
     let parent: Vec<&str> = parent.iter().map(|s| s.as_str()).collect();
     let csegs = candidate_segments(c);
@@ -761,7 +769,15 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         }
         let mut chain: Vec<&str> = parent.clone();
         chain.push(name);
-        csegs.ends_with(&chain)
+        if csegs.ends_with(&chain) {
+            return true;
+        }
+        // A directory scope also matches its crate-root file
+        // (`super::B` from `src/a.rs` scopes to `src/`, whose root module
+        // is `src/lib.rs`).
+        !csegs.is_empty()
+            && matches!(csegs[csegs.len() - 1], "lib" | "main")
+            && csegs[..csegs.len() - 1].ends_with(&parent[..])
     } else {
         // Dotted package paths name the package the class lives in: the
         // parent chain must be a suffix of the candidate's directory, with
@@ -1538,6 +1554,46 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("super::B binds src/a.rs")).unwrap();
         assert_eq!(target.file, "src/a.rs");
+    }
+
+    #[test]
+    fn super_with_remaining_path_binds_that_submodule() {
+        // `super::child::B` from src/a/x.rs means src/a/child — not src/a.
+        let g = graph(&[
+            (
+                "src/a/x.rs",
+                "use super::child::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("src/a.rs", "pub struct B;\n"),
+            ("src/a/child.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/a/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("super::child binds src/a/child.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/a/child.rs");
+    }
+
+    #[test]
+    fn crate_root_import_binds_only_root_files() {
+        // `crate::B` names the crate root: a namesake in an unrelated
+        // module must not capture it; one in the root lib.rs binds.
+        let g = graph(&[
+            ("src/lib.rs", "pub struct B;\n"),
+            ("src/unrelated.rs", "pub struct B;\n"),
+            ("src/x.rs", "use crate::B;\nfn main() { let _b: B; }\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("crate::B binds the root B")).unwrap();
+        assert_eq!(target.file, "src/lib.rs");
     }
 
     #[test]
