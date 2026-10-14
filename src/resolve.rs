@@ -523,6 +523,9 @@ fn resolve_import(
                     .join("/");
                 let on_path =
                     c.file == full || (full.contains('/') && c.file.ends_with(&format!("/{full}")));
+                if full.contains('/') && !on_path {
+                    continue; // `sub/b.h` never means an unrelated same-basename file
+                }
                 let score = 1
                     + u32::from(on_path) * 32
                     + u32::from(parent_path(&c.file) == parent_path(caller.file)) * 8;
@@ -546,11 +549,18 @@ fn resolve_import(
     // symbol inside one). Normalize `crate::a::B`, `app.store.Repo`, `./b`
     // down to the candidate name.
     let seg = eff.rsplit(['/', '\\']).next().unwrap_or(eff);
-    let name = seg
-        .rsplit("::")
-        .next()
-        .and_then(|s| s.rsplit('.').next())
-        .unwrap_or(seg);
+    // Relative paths keep their full final component for the exact path
+    // comparison below; the *lookup* name is its first dot segment, because
+    // module symbols are named by the file stem before the first dot
+    // (`b.test.ts` → `b`).
+    let name = if relative {
+        seg.split('.').next().unwrap_or(seg)
+    } else {
+        seg.rsplit("::")
+            .next()
+            .and_then(|s| s.rsplit('.').next())
+            .unwrap_or(seg)
+    };
     let segments: Vec<&str> = eff
         .split([':', '.', '/', '\\', ' '])
         .filter(|s| !s.is_empty())
@@ -711,6 +721,7 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
     // same-named symbol in the language.
     let mut supers = 0usize;
     let mut caller_relative = false;
+    let mut crate_rooted = false;
     while matches!(
         parent.first().map(|s| s.as_str()),
         Some("crate") | Some("self") | Some("super")
@@ -721,7 +732,8 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
                 caller_relative = true;
             }
             "self" => caller_relative = true,
-            _ => {} // `crate::` is root-relative, not caller-relative
+            "crate" => crate_rooted = true,
+            _ => {}
         }
     }
     if caller_relative {
@@ -754,8 +766,12 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         if matches!(root_file, "lib.rs" | "main.rs") {
             return true;
         }
+        // A root-level module lives directly under the source root
+        // (`src/a.rs` or `a.rs`), never nested (`src/nested/a.rs`).
+        let csegs = candidate_segments(c);
         return c.kind == SymbolKind::Module
-            && candidate_segments(c).ends_with(&[name.to_string()]);
+            && csegs.ends_with(&[name.to_string()])
+            && csegs.len() <= 2;
     }
     let parent: Vec<&str> = parent.iter().map(|s| s.as_str()).collect();
     let csegs = candidate_segments(c);
@@ -772,11 +788,19 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         // an acceptable anchor. (Cost: an import qualified by the crate's
         // own *name* — `codescope::fresh::LiveGraph` from inside `codescope`
         // — stays unbound; use `crate::`-style paths.)
+        let mut chain: Vec<&str> = parent.clone();
+        chain.push(name);
+        // A crate-rooted path counts segments from the crate root, so at
+        // most one directory (the source root) may sit above the matched
+        // chain — for a symbol import the chain is the module path, for a
+        // module import it includes the final name.
+        if crate_rooted {
+            return (csegs.ends_with(&parent[..]) && csegs.len() <= parent.len() + 1)
+                || (csegs.ends_with(&chain) && csegs.len() <= chain.len() + 1);
+        }
         if csegs.ends_with(&parent[..]) {
             return true;
         }
-        let mut chain: Vec<&str> = parent.clone();
-        chain.push(name);
         if csegs.ends_with(&chain) {
             return true;
         }
@@ -1644,6 +1668,65 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("same full directory wins")).unwrap();
         assert_eq!(target.file, "app/include/head.h");
+    }
+
+    #[test]
+    fn multi_component_include_with_missing_path_stays_unbound() {
+        // `#include "missing/b.h"` with no file at that path must not fall
+        // back to an unrelated same-basename header.
+        let g = graph(&[
+            ("main/b.h", "int main_b(void);\n"),
+            (
+                "main/main.c",
+                "#include \"missing/b.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "main/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "missing/b.h must not bind main/b.h");
+    }
+
+    #[test]
+    fn crate_root_module_rejects_nested_namesake() {
+        // `use crate::a;` with only src/nested/a.rs present stays unbound —
+        // a root-level module is not a nested one.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a;\nfn main() { let _m: a::Thing; }\n",
+            ),
+            ("src/nested/a.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "crate::a must not bind src/nested/a.rs");
+    }
+
+    #[test]
+    fn dotted_relative_module_import_binds() {
+        // `./b.test` targets b.test.ts; the lookup name is the stem before
+        // the first dot (`b`), and the exact path comparison carries the
+        // dotted basename.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b.test\";\nexport function a() { return b(); }\n",
+            ),
+            ("b.test.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("./b.test binds b.test.ts")).unwrap();
+        assert_eq!(target.file, "b.test.ts");
     }
 
     #[test]
