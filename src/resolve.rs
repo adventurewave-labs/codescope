@@ -621,8 +621,19 @@ fn resolve_import(
             if candidate_segments(c) != target {
                 continue;
             }
-            let score = 1;
+            // `./b` prefers the FILE b.ts over the directory module
+            // b/index.ts when both normalize to the same path.
+            let fstem = c
+                .file
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&c.file)
+                .split('.')
+                .next()
+                .unwrap_or("");
+            let score = 1 + u32::from(Some(fstem) == target.last().map(|s| s.as_str())) * 2;
             match best {
+                Some((_, b)) if b > score => {}
                 Some((_, b)) if b == score => ties += 1,
                 _ => {
                     best = Some((c.id, score));
@@ -816,8 +827,20 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         if !csegs.starts_with(&prefix[..]) {
             return false; // another crate's tree (workspace sibling)
         }
+        // The binary (main.rs) and library (lib.rs) are separate crates:
+        // a `crate::` import binds only the caller's OWN root file.
+        let caller_root = if caller
+            .file
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|f| f == "main.rs")
+        {
+            "main.rs"
+        } else {
+            "lib.rs"
+        };
         let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
-        if matches!(root_file, "lib.rs" | "main.rs")
+        if root_file == caller_root
             && csegs.starts_with(&prefix[..])
             && csegs.len() <= pref.len() + 1
         {
@@ -2009,6 +2032,62 @@ mod tests {
             .unwrap();
         assert_eq!(target.file, "pkg/lib.py");
         assert_eq!(target.kind, SymbolKind::Function);
+    }
+
+    #[test]
+    fn crate_import_from_main_does_not_reach_the_library() {
+        // `crate::B` from the binary root binds only main.rs's own B —
+        // lib.rs is a separate crate.
+        let g = graph(&[
+            ("src/main.rs", "use crate::B;\nfn main() { let _b: B; }\n"),
+            ("src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "crate::B from main.rs must not bind lib.rs");
+
+        let g2 = graph(&[
+            ("src/main.rs", "use crate::B;\nfn main() { let _b: B; }\n"),
+            ("src/main.rs", "fn placeholder() {}\n"),
+        ]);
+        let _ = g2; // single-file case covered by the next fixture
+        let g3 = graph(&[
+            (
+                "src/main.rs",
+                "use crate::B;\nfn main() { let _b: B; }\npub struct B;\n",
+            ),
+            ("src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from3 = module_of(&g3, "src/main.rs");
+        let e3 = g3
+            .out_edges(from3)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g3.symbol(e3.to.expect("own root B binds")).unwrap();
+        assert_eq!(target.file, "src/main.rs");
+    }
+
+    #[test]
+    fn relative_import_prefers_file_over_directory_module() {
+        // `./b` with BOTH b.ts and b/index.ts present: the file wins.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b\";\nexport function a() { return b(); }\n",
+            ),
+            ("b.ts", "export function b() { return 1; }\n"),
+            ("b/index.ts", "export function b() { return 2; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("b.ts beats b/index.ts")).unwrap();
+        assert_eq!(target.file, "b.ts");
     }
 
     #[test]
