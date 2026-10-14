@@ -710,6 +710,15 @@ fn resolve_import(
             if !proven_for_candidate(eff, &segments, c, caller, has_lib, has_main) {
                 continue;
             }
+            // Python's `import a.b.c` imports a MODULE (a `from`-import of a
+            // symbol is a different statement the extractor captures
+            // separately): dotted python chains bind module candidates only.
+            if caller.language == Language::Python
+                && !eff.contains("::")
+                && c.kind != SymbolKind::Module
+            {
+                continue;
+            }
         } else if c.kind != SymbolKind::Module {
             continue; // a bare import names a module, never a function
         }
@@ -2118,14 +2127,32 @@ mod tests {
     }
 
     #[test]
-    fn dotted_chain_resolves_symbols_inside_the_module() {
-        // `pkg.lib.run` names the symbol `run` inside module pkg/lib.py —
-        // the parent chain equals the candidate's whole module path.
+    fn python_dotted_chain_binds_only_modules() {
+        // `import pkg.lib.run` imports the MODULE run (pkg/lib/run.py) —
+        // binding the function run in pkg/lib.py would be `from pkg.lib
+        // import run`, a different statement.
         let g = graph(&[
             ("pkg/lib.py", "def run(x):\n    return x\n"),
+            ("app.py", "import pkg.lib.run\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import pkg.lib.run must not bind the function run in pkg/lib.py"
+        );
+    }
+
+    #[test]
+    fn python_dotted_chain_binds_a_real_submodule() {
+        let g = graph(&[
+            ("pkg/lib/run.py", "def go(x):\n    return x\n"),
             (
                 "app.py",
-                "import pkg.lib.run\n\ndef go():\n    return pkg.lib.run(1)\n",
+                "import pkg.lib.run\n\ndef main():\n    return pkg.lib.run.go(1)\n",
             ),
         ]);
         let from = module_of(&g, "app.py");
@@ -2134,10 +2161,10 @@ mod tests {
             .find(|e| e.kind == EdgeKind::Imports)
             .unwrap();
         let target = g
-            .symbol(e.to.expect("pkg.lib.run binds run in pkg/lib.py"))
+            .symbol(e.to.expect("pkg.lib.run binds pkg/lib/run.py"))
             .unwrap();
-        assert_eq!(target.file, "pkg/lib.py");
-        assert_eq!(target.kind, SymbolKind::Function);
+        assert_eq!(target.file, "pkg/lib/run.py");
+        assert_eq!(target.kind, SymbolKind::Module);
     }
 
     #[test]
