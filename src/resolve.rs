@@ -752,11 +752,9 @@ fn module_segments(path: &str, lang: Option<Language>) -> Vec<String> {
         if matches!(stem, "mod" | "__init__" | "index") {
             return segs;
         }
-        if lang == Some(Language::Rust) && stem == "lib" {
-            return segs; // the library crate root IS the root directory's module
+        if lang == Some(Language::Rust) && matches!(stem, "lib" | "main") {
+            return segs; // crate-root files ARE the root directory's module
         }
-        // `main.rs` is a separate (binary) crate root: it keeps its own
-        // identity so `self::` from it cannot reach the library's items.
     }
     segs.push(stem.to_string());
     segs
@@ -802,6 +800,7 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
             _ => {}
         }
     }
+    let bare = caller_relative && parent.is_empty();
     if caller_relative {
         let mut caller_segs = module_segments(caller.file, Some(caller.language));
         if supers > 0 {
@@ -814,6 +813,16 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         // both leave the root itself as scope; an empty scope binds nothing.
         if caller_segs.is_empty() {
             return false;
+        }
+        // A bare `self::X`/`super::X` from a Rust crate-root file sees only
+        // that file's own items — the sibling crate root (lib.rs vs main.rs)
+        // is a different crate. PATHED imports (`self::child::X`) are
+        // unaffected: they anchor at the root directory.
+        if bare && caller.language == Language::Rust {
+            let caller_base = caller.file.rsplit(['/', '\\']).next().unwrap_or("");
+            if matches!(caller_base, "lib.rs" | "main.rs") {
+                return c.file == caller.file;
+            }
         }
         // Keep any remaining path (`super::child::B` from `src/a/x.rs` is
         // `src/a/child`, not merely `src/a`).
@@ -910,8 +919,18 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         // inside it, `pkg.lib.run` → pkg/lib.py), or it is a suffix of the
         // candidate's directory with the file itself beyond it
         // (`app.store.Repo` → app/store/Repo.java).
+        let stem = c
+            .file
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&c.file)
+            .split('.')
+            .next()
+            .unwrap_or("");
         csegs.ends_with(&parent[..])
-            || (csegs.len() > parent.len() && csegs[..csegs.len() - 1].ends_with(&parent[..]))
+            || (csegs.len() > parent.len()
+                && csegs[..csegs.len() - 1].ends_with(&parent[..])
+                && stem == name)
     }
 }
 
@@ -2116,6 +2135,50 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("src/b.h wins")).unwrap();
         assert_eq!(target.file, "src/b.h");
+    }
+
+    #[test]
+    fn dotted_chain_rejects_sibling_module_namesake() {
+        // `pkg.lib.run` must not bind a run that lives in pkg/lib/unrelated.py
+        // — its module is pkg.lib.unrelated.
+        let g = graph(&[
+            ("pkg/lib/unrelated.py", "def run(x):\n    return x\n"),
+            (
+                "app.py",
+                "import pkg.lib.run\n\ndef go():\n    return pkg.lib.run(1)\n",
+            ),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "pkg.lib.run must not bind pkg/lib/unrelated.py's run"
+        );
+    }
+
+    #[test]
+    fn self_scoped_from_main_reaches_child_modules() {
+        // `self::child::B` from src/main.rs anchors at the crate root, so
+        // src/child.rs qualifies (the binary root owns its child modules).
+        let g = graph(&[
+            (
+                "src/main.rs",
+                "use self::child::B;\nfn main() { let _b: B; }\n",
+            ),
+            ("src/child.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("self::child binds src/child.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/child.rs");
     }
 
     #[test]
