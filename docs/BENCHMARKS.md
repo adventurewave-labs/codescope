@@ -97,8 +97,8 @@ a 2-core / 8 GB shared-vCPU Codespace (release build, rustc 1.99):
 
 | Workload | 4-core (above) | 2-core Codespace |
 |---|---|---|
-| Cold index, dense 125k LOC (502 files, 26k symbols, 50k edges) | ~0.2 s @ 100k | 0.86 s |
-| Cold index, realistic ~1.15M LOC (1,402 files, 57k symbols, **1.2M edges**) | ~1.6 s @ 909k LOC / 480k edges | 16.7 s |
+| Cold index, dense 125k LOC (501 files, 26k symbols, 50k edges) | ~0.2 s @ 100k | 0.86 s |
+| Cold index, realistic ~1.15M LOC (1,401 files, 57k symbols, **1.2M edges**) | ~1.6 s @ 909k LOC / 480k edges | 16.7 s |
 | 1-file incremental patch (1,402-file index) | 55–58 ms | 113 ms |
 | `repo_summary` in-process (criterion) | 1.69 ms | 6.8 ms |
 | `structural_search` in-process (criterion) | 1.39 ms | 1.20 ms |

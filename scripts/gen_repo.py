@@ -5,7 +5,9 @@ N files x M functions, every function 4 lines with one cross-file call —
 maximizes symbol/edge density per byte (a storage worst case).
 
 Usage: gen_repo.py [out_dir] [n_files] [n_fns]
-Defaults reproduce the 100k-LOC dense corpus: 500 files x 50 fns.
+Defaults reproduce the ~125k-LOC dense corpus (500 files x 50 fns of 5 lines
+each, incl. blank separators) used for the 2-core data point in
+docs/BENCHMARKS.md; the 4-core "100k LOC" row used 500 x 40.
 """
 import os
 import sys
