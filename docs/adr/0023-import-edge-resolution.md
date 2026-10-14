@@ -81,4 +81,10 @@ same-directory candidates get +4. A file never binds an import to itself.
   stays unbound — the full parent chain must anchor at the target's path, so
   use `crate::`-style paths; Go module-path imports (`example.com/app/store`)
   hit the dotted rule and effectively never bind — the on-disk path lacks the
-  module prefix.
+  module prefix. A bare single-segment import (`import b`) may still bind a
+  same-named module anywhere in the tree (same-directory candidates win,
+  ties are deterministic and reported as `alternatives`): Python's actual
+  resolution depends on `sys.path`, which the graph does not model — a
+  precision-tier (SCIP) concern, inherited from the pre-ADR-0023 behavior
+  but now confined to modules of the caller's language family whose identity
+  matches the name.
