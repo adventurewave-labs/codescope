@@ -910,6 +910,26 @@ fn proven_for_candidate(
     if csegs.len() < parent.len() {
         return false;
     }
+    // `super::` that climbed to the crate root from a module file is the
+    // same ambiguity as `crate::B`: with both roots present, a root-file
+    // item could belong to either crate — abstain.
+    if caller_relative
+        && supers > 0
+        && has_lib
+        && has_main
+        && !matches!(
+            caller.file.rsplit(['/', '\\']).next().unwrap_or(""),
+            "lib.rs" | "main.rs"
+        )
+    {
+        let prefix = crate_root_prefix(caller.file);
+        let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+        let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or("");
+        if matches!(root_file, "lib.rs" | "main.rs") && parent[..] == pref[..] && csegs == pref[..]
+        {
+            return false;
+        }
+    }
     if raw.contains("::") {
         // The full parent chain must anchor at the candidate: a shorter
         // suffix would let `crate::a::b::B` bind any `B` under a `b.rs`
@@ -2294,6 +2314,41 @@ mod tests {
             .find(|e| e.kind == EdgeKind::Imports)
             .unwrap();
         assert!(e.to.is_none(), "nested lib.rs is not the crate root");
+    }
+
+    #[test]
+    fn super_to_root_abstains_when_both_roots_exist() {
+        // `super::B` from src/child.rs climbing to the crate root: with both
+        // lib.rs and main.rs present, the root item's crate is ambiguous.
+        let g = graph(&[
+            ("src/child.rs", "use super::B;\nfn run() { let _b: B; }\n"),
+            ("src/lib.rs", "pub struct B;\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "super::B to the root must abstain when both roots exist"
+        );
+    }
+
+    #[test]
+    fn super_to_root_binds_the_single_root() {
+        let g = graph(&[
+            ("src/child.rs", "use super::B;\nfn run() { let _b: B; }\n"),
+            ("src/main.rs", "pub struct B;\nfn main() {}\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("the single root binds")).unwrap();
+        assert_eq!(target.file, "src/main.rs");
     }
 
     #[test]
