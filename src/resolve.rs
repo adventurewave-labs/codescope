@@ -1027,7 +1027,11 @@ fn proven_for_candidate(
         // A directory package (`import pkg.sub` → pkg/sub/__init__.py, whose
         // module identity is [pkg, sub]) matches the full imported chain.
         let package_match = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
-        csegs.ends_with(&parent[..])
+        // The whole-path rule (a symbol inside the module at `parent`) is a
+        // type-system thing (Java/C#) — for Python it would bind a missing
+        // submodule to its parent package.
+        let symbol_in_module = caller.language != Language::Python && csegs.ends_with(&parent[..]);
+        symbol_in_module
             || package_match
             || (csegs.len() > parent.len()
                 && csegs[..csegs.len() - 1].ends_with(&parent[..])
@@ -2484,6 +2488,25 @@ mod tests {
         let target = g.symbol(e.to.expect("pkg.sub binds the package")).unwrap();
         assert_eq!(target.file, "pkg/sub/__init__.py");
         assert_eq!(target.kind, SymbolKind::Module);
+    }
+
+    #[test]
+    fn python_missing_submodule_stays_unbound() {
+        // `import pkg.missing` with only the package present must not bind
+        // the parent package as the nonexistent submodule.
+        let g = graph(&[
+            ("pkg/__init__.py", "\n"),
+            ("app.py", "import pkg.missing\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import pkg.missing must not bind the pkg package itself"
+        );
     }
 
     #[test]
