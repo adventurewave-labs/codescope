@@ -530,21 +530,28 @@ fn resolve_import(
                 // the full parent path — see `parent_path`.
                 // Normalize away `.`/`..` components so `../sub/b.h` competes
                 // on its real path.
-                let full: String = eff
-                    .split(['/', '\\'])
-                    .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-                    .collect::<Vec<_>>()
-                    .join("/");
-                let on_path =
-                    c.file == full || (full.contains('/') && c.file.ends_with(&format!("/{full}")));
-                // The importer-relative target (`sub/b.h` from src/main.c
-                // means src/sub/b.h) outranks the same suffix at the repo
-                // root — C searches the includer's directory first.
-                let local_target = match parent_path(caller.file) {
-                    "" => full.to_string(),
-                    d => format!("{d}/{full}"),
-                };
-                let local_hit = c.file == local_target;
+                // The import's own suffix with `..` APPLIED (`sub/../b.h` →
+                // `b.h`, not `sub/b.h`): internal parent traversal pops, it
+                // does not vanish.
+                let mut suffix_parts: Vec<&str> = Vec::new();
+                for t in eff.split(['/', '\\']).filter(|s| !s.is_empty()) {
+                    if t == ".." {
+                        suffix_parts.pop();
+                    } else if t != "." {
+                        suffix_parts.push(t);
+                    }
+                }
+                let full = suffix_parts.join("/");
+                let on_path = !full.is_empty()
+                    && (c.file == full
+                        || (full.contains('/') && c.file.ends_with(&format!("/{full}"))));
+                // The importer-relative target — components resolved
+                // against the includer's directory with `..` applied
+                // (`sub/../b.h` from src/main.c means src/b.h) — outranks
+                // the same suffix at the repo root: C searches the
+                // includer's directory first.
+                let local_hit =
+                    relative_components(eff, caller.file).is_some_and(|t| c.file == t.join("/"));
                 if full.contains('/') && !on_path {
                     continue; // `sub/b.h` never means an unrelated same-basename file
                 }
@@ -2088,6 +2095,27 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("b.ts beats b/index.ts")).unwrap();
         assert_eq!(target.file, "b.ts");
+    }
+
+    #[test]
+    fn internal_dotdot_include_resolves_components() {
+        // `#include "sub/../b.h"` from src/main.c means src/b.h — the `..`
+        // pops `sub`, it does not simply vanish.
+        let g = graph(&[
+            ("src/sub/b.h", "int sub_b(void);\n"),
+            ("src/b.h", "int top_b(void);\n"),
+            (
+                "src/main.c",
+                "#include \"sub/../b.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "src/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("src/b.h wins")).unwrap();
+        assert_eq!(target.file, "src/b.h");
     }
 
     #[test]
