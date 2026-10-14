@@ -82,8 +82,8 @@ keeps this swappable without touching the query or extraction layers.
   function 4 lines with one call — maximizes symbol/edge density per byte (a
   storage worst case).
 - **Realistic corpus** (`scripts/gen_realistic.py`): functions with doc
-  comments, input validation, loops and ~9 call sites each (~18 LOC/symbol) —
-  closer to real Rust.
+  comments, input validation, loops and ~9 call sites each (21 lines per
+  function, ~21 LOC/symbol) — closer to real Rust.
 - **Query/throughput**: `cargo bench` (criterion) — `benches/index_bench.rs`,
   `benches/query_bench.rs`.
 - **Correctness**: unit/integration tests (`cargo test`), plus dogfooding —

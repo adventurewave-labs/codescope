@@ -76,5 +76,6 @@ same-directory candidates get +4. A file never binds an import to itself.
 - The 85-site call-resolution eval is unchanged (1.00 / 0.97 / 0.98) — call
   edges take the pre-existing scoring path untouched.
 - Known limits: Rust glob imports (`use a::{b, c}`) stay unbound (the
-  normalized name is a brace expression); Go package imports bind only when a
-  file stem matches the package name.
+  normalized name is a brace expression); Go module-path imports
+  (`example.com/app/store`) hit the dotted rule and effectively never bind —
+  the on-disk path lacks the module prefix.

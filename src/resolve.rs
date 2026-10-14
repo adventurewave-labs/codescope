@@ -490,11 +490,22 @@ fn resolve_import(
                 if lang_family(c.language) != lang_family(caller.language) {
                     continue;
                 }
-                // Prefer resolving against the importing file's own directory
-                // (how C/C++ `#include "..."` and relative TS imports resolve).
-                // `c.dir` is the last directory segment — see `stem_and_dir`;
-                // `dir_of` mirrors that contract.
-                let score = 1 + u32::from(c.dir == dir_of(caller.file)) * 8;
+                // A multi-component include (`sub/b.h`, `../sub/b.h`) must
+                // honor its path: a file at that exact suffix beats a
+                // same-basename file in the importer's directory. `c.dir` is
+                // the last directory segment — see `stem_and_dir`; `dir_of`
+                // mirrors that contract.
+                // Normalize away `.`/`..` components so `../sub/b.h` competes
+                // on its real path.
+                let full: String = eff
+                    .split(['/', '\\'])
+                    .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let on_path =
+                    c.file == full || (full.contains('/') && c.file.ends_with(&format!("/{full}")));
+                let score =
+                    1 + u32::from(on_path) * 32 + u32::from(c.dir == dir_of(caller.file)) * 8;
                 match best {
                     Some((_, b)) if b > score => {}
                     Some((_, b)) if b == score => ties += 1,
@@ -576,7 +587,12 @@ fn resolve_import(
     }
 
     let qualified = segments.len() > 1;
-    if qualified && matches!(segments.first(), Some(&"std") | Some(&"core") | Some(&"alloc")) {
+    if qualified
+        && matches!(
+            segments.first(),
+            Some(&"std") | Some(&"core") | Some(&"alloc")
+        )
+    {
         return None; // Rust prelude roots are never in-repo
     }
 
@@ -587,7 +603,7 @@ fn resolve_import(
             continue;
         }
         if qualified {
-            if !proven_for_candidate(&segments, c) {
+            if !proven_for_candidate(eff, &segments, c) {
                 continue;
             }
         } else if c.kind != SymbolKind::Module {
@@ -619,15 +635,22 @@ fn resolve_import(
 /// (`src/fresh.rs` → ["src", "fresh"]).
 fn candidate_segments(c: &Cand) -> Vec<String> {
     let fname = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
-    let stem = fname.split('.').next().unwrap_or(fname);
+    // Strip only the final extension: `b.test.ts` stems to `b.test`.
+    let stem = match fname.rsplit_once('.') {
+        Some((s, e)) if is_code_extension(e) => s,
+        _ => fname.split('.').next().unwrap_or(fname),
+    };
     let mut segs: Vec<String> = c
         .dir_path
-        .split('/')
+        .split(['/', '\\'])
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    if matches!(stem, "mod" | "__init__" | "index" | "lib") && !segs.is_empty() {
-        return segs; // the module is named by its directory
+    // `mod.rs` / `__init__.py` / `index.ts` are named by their directory.
+    // (`lib.rs` is deliberately NOT remapped: a python `pkg/lib.py` is a real
+    // module named `lib`, not the directory's package root.)
+    if matches!(stem, "mod" | "__init__" | "index") && !segs.is_empty() {
+        return segs;
     }
     segs.push(stem.to_string());
     segs
@@ -645,7 +668,7 @@ fn candidate_segments(c: &Cand) -> Vec<String> {
 ///   suffix — `app.store.Repo` passes for `app/store/Repo.java`, while
 ///   `java.util.List` fails even beside a `java/` directory (there is no
 ///   `java/util` chain above the candidate).
-fn proven_for_candidate(segments: &[&str], c: &Cand) -> bool {
+fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand) -> bool {
     let parent = &segments[..segments.len() - 1];
     let parent: Vec<&str> = parent
         .iter()
@@ -660,8 +683,7 @@ fn proven_for_candidate(segments: &[&str], c: &Cand) -> bool {
     if csegs.len() < parent.len() {
         return false;
     }
-    let joined = segments.join("");
-    if joined.contains("::") || segments.iter().any(|s| *s == "crate") {
+    if raw.contains("::") {
         (1..=parent.len()).any(|i| csegs.ends_with(&parent[i - 1..]))
     } else {
         // Dotted package paths name the package the class lives in: the
@@ -984,17 +1006,19 @@ mod tests {
 
     #[test]
     fn imports_never_cross_language_families() {
-        // `import b` in Python must bind py/b.py, never the C++ header that
-        // shares the module stem (polyglot repos have both).
+        // `import b` in Python must bind py/b.py, never a same-named module
+        // of another language — even when the decoy sits in the importer's
+        // own directory (without the family guard the decoy would win on
+        // the same-directory bonus).
         let g = graph(&[
             (
                 "py/a.py",
                 "import b\n\ndef alpha(x):\n    return b.beta(x)\n",
             ),
             ("py/b.py", "def beta(x):\n    return x\n"),
-            ("cpp/b.hpp", "int beta_cpp(int x);\n"),
+            ("py/b.hpp", "int beta_cpp(int x);\n"),
         ]);
-        let from = g.by_name("a")[0];
+        let from = module_of(&g, "py/a.py");
         let e = g
             .out_edges(from)
             .find(|e| e.kind == EdgeKind::Imports && e.to_name == "b")
@@ -1128,7 +1152,10 @@ mod tests {
         let g = graph(&[
             ("lib/util/head.h", "int lu(void);\n"),
             ("c/d/head.h", "int cd(void);\n"),
-            ("c/d/main.c", "#include \"head.h\"\nint main(void) { return 0; }\n"),
+            (
+                "c/d/main.c",
+                "#include \"head.h\"\nint main(void) { return 0; }\n",
+            ),
         ]);
         let from = module_of(&g, "c/d/main.c");
         let e = g
@@ -1143,7 +1170,10 @@ mod tests {
         // `../lib/b` from c/d/x.ts means c/lib/b — not the same-named module
         // sitting in the importer's own directory.
         let g = graph(&[
-            ("c/d/x.ts", "import { b } from \"../lib/b\";\nexport function x() { return b(); }\n"),
+            (
+                "c/d/x.ts",
+                "import { b } from \"../lib/b\";\nexport function x() { return b(); }\n",
+            ),
             ("c/d/b.ts", "export function b() { return 1; }\n"),
             ("c/lib/b.ts", "export function b() { return 2; }\n"),
         ]);
@@ -1159,7 +1189,10 @@ mod tests {
     #[test]
     fn nodenext_js_extension_resolves_to_ts() {
         let g = graph(&[
-            ("a.ts", "import { b } from \"./b.js\";\nexport function a() { return b(); }\n"),
+            (
+                "a.ts",
+                "import { b } from \"./b.js\";\nexport function a() { return b(); }\n",
+            ),
             ("b.ts", "export function b() { return 1; }\n"),
         ]);
         let from = module_of(&g, "a.ts");
@@ -1193,7 +1226,10 @@ mod tests {
     fn std_path_with_in_repo_stem_stays_unbound() {
         // An in-repo `sync.rs` must not vouch for `std::sync::Arc`.
         let g = graph(&[
-            ("src/x.rs", "use std::sync::Arc;\nfn main() { let _a: Arc; }\n"),
+            (
+                "src/x.rs",
+                "use std::sync::Arc;\nfn main() { let _a: Arc; }\n",
+            ),
             ("src/sync.rs", "pub struct Arc;\n"),
         ]);
         let from = module_of(&g, "src/x.rs");
@@ -1202,6 +1238,68 @@ mod tests {
             .find(|e| e.kind == EdgeKind::Imports)
             .unwrap();
         assert!(e.to.is_none(), "std:: paths are never in-repo");
+    }
+
+    #[test]
+    fn external_crate_path_with_in_repo_stem_stays_unbound() {
+        // Not just the std prelude: a third-party path (`serde::de::…`)
+        // beside an in-repo `de.rs` must stay unbound — the parent chain
+        // must be proven against the *candidate's own* path.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use serde::de::Deserialize;\nfn main() { let _d: Deserialize; }\n",
+            ),
+            ("src/de.rs", "pub mod other { pub struct Noop; }\n"),
+            ("src/y.rs", "pub struct Deserialize;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "serde::de::Deserialize must not capture the in-repo Deserialize"
+        );
+    }
+
+    #[test]
+    fn python_dotted_submodule_binds() {
+        let g = graph(&[
+            ("pkg/__init__.py", "\n"),
+            ("pkg/lib.py", "def run(x):\n    return x\n"),
+            (
+                "app.py",
+                "import pkg.lib\n\ndef go():\n    return pkg.lib.run(1)\n",
+            ),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("pkg.lib binds")).unwrap();
+        assert_eq!(target.file, "pkg/lib.py");
+    }
+
+    #[test]
+    fn multi_component_include_honors_its_path() {
+        let g = graph(&[
+            ("sub/b.h", "int sub_b(void);\n"),
+            ("main/b.h", "int main_b(void);\n"),
+            (
+                "main/main.c",
+                "#include \"b.h\"\n#include \"../sub/b.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "main/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "../sub/b.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("../sub/b.h resolves")).unwrap();
+        assert_eq!(target.file, "sub/b.h");
     }
 
     #[test]
