@@ -526,9 +526,13 @@ fn resolve_import(
                 if full.contains('/') && !on_path {
                     continue; // `sub/b.h` never means an unrelated same-basename file
                 }
+                // C `#include "..."` searches the importer's directory
+                // FIRST, then the include path — so a header beside the
+                // importer outranks a same-basename file at the named path
+                // root.
                 let score = 1
-                    + u32::from(on_path) * 32
-                    + u32::from(parent_path(&c.file) == parent_path(caller.file)) * 8;
+                    + u32::from(parent_path(&c.file) == parent_path(caller.file)) * 32
+                    + u32::from(on_path) * 16;
                 match best {
                     Some((_, b)) if b > score => {}
                     Some((_, b)) if b == score => ties += 1,
@@ -790,18 +794,22 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         // — stays unbound; use `crate::`-style paths.)
         let mut chain: Vec<&str> = parent.clone();
         chain.push(name);
+        // The extended chain (`parent + name`) is a MODULE path: only a
+        // module candidate may match it — otherwise `use crate::a::B` could
+        // bind a struct `B` in `src/a/B.rs`.
+        let chain_match = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
         // A crate-rooted path counts segments from the crate root, so at
         // most one directory (the source root) may sit above the matched
         // chain — for a symbol import the chain is the module path, for a
         // module import it includes the final name.
         if crate_rooted {
             return (csegs.ends_with(&parent[..]) && csegs.len() <= parent.len() + 1)
-                || (csegs.ends_with(&chain) && csegs.len() <= chain.len() + 1);
+                || (chain_match && csegs.len() <= chain.len() + 1);
         }
         if csegs.ends_with(&parent[..]) {
             return true;
         }
-        if csegs.ends_with(&chain) {
+        if chain_match {
             return true;
         }
         // A directory scope also matches its crate-root file
@@ -1727,6 +1735,54 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("./b.test binds b.test.ts")).unwrap();
         assert_eq!(target.file, "b.test.ts");
+    }
+
+    #[test]
+    fn header_beside_importer_outranks_root_namesake() {
+        // `#include "head.h"` from src/main.c: the header in the importer's
+        // directory wins over a same-named file at the exact import path
+        // root (C searches the includer's directory first).
+        let g = graph(&[
+            ("head.h", "int root_head(void);\n"),
+            ("src/head.h", "int src_head(void);\n"),
+            (
+                "src/main.c",
+                "#include \"head.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "src/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "head.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("src/head.h wins")).unwrap();
+        assert_eq!(target.file, "src/head.h");
+    }
+
+    #[test]
+    fn module_chain_binds_the_module_not_a_symbol_namesake() {
+        // `use crate::a::B;` where src/a/B.rs holds a struct B: the module
+        // path `crate::a::B` IS the file src/a/B.rs, so the import binds its
+        // module symbol — never the struct inside it (that would be
+        // `crate::a::B::B`).
+        let g = graph(&[
+            ("src/x.rs", "use crate::a::B;\nfn main() { let _b: B; }\n"),
+            ("src/a/B.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("the module crate::a::B binds"))
+            .unwrap();
+        assert_eq!(target.file, "src/a/B.rs");
+        assert_eq!(
+            target.kind,
+            SymbolKind::Module,
+            "the struct namesake must not capture the import"
+        );
     }
 
     #[test]
