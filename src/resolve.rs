@@ -602,11 +602,11 @@ fn resolve_import(
         .get(name)
         .map(|v| v.iter().collect())
         .unwrap_or_default();
-    if relative || (segments.len() > 1 && !eff.contains("::")) {
-        // A relative path or dotted package may target a directory module
-        // (`./b` → b/index.ts, `import pkg.sub` → pkg/sub/__init__.py),
-        // whose module symbol keeps the entry-file's name — the path
-        // evidence below does the filtering.
+    {
+        // Any import may target a directory module whose symbol keeps the
+        // entry-file's name (`./b` → b/index.ts, `import pkg` →
+        // pkg/__init__.py, `use crate::a;` → src/a/mod.rs) — always
+        // collect those candidates; the path evidence does the filtering.
         for alt in ["index", "__init__", "mod"] {
             if let Some(v) = name_index.get(alt) {
                 cand_vec.extend(v.iter());
@@ -2507,6 +2507,46 @@ mod tests {
             e.to.is_none(),
             "import pkg.missing must not bind the pkg package itself"
         );
+    }
+
+    #[test]
+    fn crate_root_module_import_binds_mod_rs() {
+        // `use crate::a;` with the module as a directory: src/a/mod.rs.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a;\nfn main() { let _m: a::Thing; }\n",
+            ),
+            ("src/a/mod.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("crate::a binds src/a/mod.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/a/mod.rs");
+    }
+
+    #[test]
+    fn bare_python_package_import_binds_init() {
+        // `import pkg` with the package as a directory: pkg/__init__.py.
+        let g = graph(&[
+            ("pkg/__init__.py", "\n"),
+            ("app.py", "import pkg\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("import pkg binds the package"))
+            .unwrap();
+        assert_eq!(target.file, "pkg/__init__.py");
+        assert_eq!(target.kind, SymbolKind::Module);
     }
 
     #[test]
