@@ -713,11 +713,7 @@ fn candidate_segments(c: &Cand) -> Vec<String> {
 /// file stem, with `mod.rs` / `__init__.py` / `index.ts` named by their
 /// directory. (`lib.rs` is deliberately NOT remapped: a python `pkg/lib.py`
 /// is a real module named `lib`, not the directory's package root.)
-fn file_module_segments(path: &str) -> Vec<String> {
-    module_segments(path, None)
-}
-
-/// [`file_module_segments`] with language awareness: a Rust crate-root file
+/// A file's module identity as path segments, with language awareness: a Rust
 /// (`src/lib.rs`, `src/main.rs`) IS the crate root directory's module, not a
 /// module named `lib`/`main` beside it. (Python `pkg/lib.py` stays a real
 /// module named `lib`.)
@@ -738,9 +734,11 @@ fn module_segments(path: &str, lang: Option<Language>) -> Vec<String> {
         if matches!(stem, "mod" | "__init__" | "index") {
             return segs;
         }
-        if lang == Some(Language::Rust) && matches!(stem, "lib" | "main") {
-            return segs; // the crate-root file is the root directory's module
+        if lang == Some(Language::Rust) && stem == "lib" {
+            return segs; // the library crate root IS the root directory's module
         }
+        // `main.rs` is a separate (binary) crate root: it keeps its own
+        // identity so `self::` from it cannot reach the library's items.
     }
     segs.push(stem.to_string());
     segs
@@ -819,7 +817,10 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
             return false; // another crate's tree (workspace sibling)
         }
         let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
-        if csegs.len() == pref.len() && matches!(root_file, "lib.rs" | "main.rs") {
+        if matches!(root_file, "lib.rs" | "main.rs")
+            && csegs.starts_with(&prefix[..])
+            && csegs.len() <= pref.len() + 1
+        {
             return true;
         }
         return c.kind == SymbolKind::Module
@@ -874,10 +875,13 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
             && matches!(csegs[csegs.len() - 1], "lib" | "main")
             && csegs[..csegs.len() - 1].ends_with(&parent[..])
     } else {
-        // Dotted package paths name the package the class lives in: the
-        // parent chain must be a suffix of the candidate's directory, with
-        // the file itself beyond it.
-        csegs.len() > parent.len() && csegs[..csegs.len() - 1].ends_with(&parent[..])
+        // Dotted package paths name the package the class lives in: either
+        // the parent chain is the candidate's entire module path (a symbol
+        // inside it, `pkg.lib.run` → pkg/lib.py), or it is a suffix of the
+        // candidate's directory with the file itself beyond it
+        // (`app.store.Repo` → app/store/Repo.java).
+        csegs.ends_with(&parent[..])
+            || (csegs.len() > parent.len() && csegs[..csegs.len() - 1].ends_with(&parent[..]))
     }
 }
 
@@ -1966,9 +1970,9 @@ mod tests {
     }
 
     #[test]
-    fn self_scoped_from_main_binds_lib_root() {
-        // src/main.rs and src/lib.rs are both the crate root: `self::B`
-        // from main.rs may bind lib.rs's B.
+    fn self_scoped_from_main_does_not_reach_the_library() {
+        // src/main.rs is a separate (binary) crate root: `self::B` there
+        // cannot reach the library crate's items in src/lib.rs.
         let g = graph(&[
             ("src/main.rs", "use self::B;\nfn main() { let _b: B; }\n"),
             ("src/lib.rs", "pub struct B;\n"),
@@ -1978,8 +1982,33 @@ mod tests {
             .out_edges(from)
             .find(|e| e.kind == EdgeKind::Imports)
             .unwrap();
-        let target = g.symbol(e.to.expect("self::B binds the lib root")).unwrap();
-        assert_eq!(target.file, "src/lib.rs");
+        assert!(
+            e.to.is_none(),
+            "self::B from main.rs must not bind the library's B"
+        );
+    }
+
+    #[test]
+    fn dotted_chain_resolves_symbols_inside_the_module() {
+        // `pkg.lib.run` names the symbol `run` inside module pkg/lib.py —
+        // the parent chain equals the candidate's whole module path.
+        let g = graph(&[
+            ("pkg/lib.py", "def run(x):\n    return x\n"),
+            (
+                "app.py",
+                "import pkg.lib.run\n\ndef go():\n    return pkg.lib.run(1)\n",
+            ),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("pkg.lib.run binds run in pkg/lib.py"))
+            .unwrap();
+        assert_eq!(target.file, "pkg/lib.py");
+        assert_eq!(target.kind, SymbolKind::Function);
     }
 
     #[test]
