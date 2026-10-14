@@ -706,7 +706,7 @@ fn relative_components(raw: &str, caller_file: &str) -> Option<Vec<String>> {
 /// The candidate's path as segments, file stem for the final component
 /// (`src/fresh.rs` → ["src", "fresh"]).
 fn candidate_segments(c: &Cand) -> Vec<String> {
-    file_module_segments(&c.file)
+    module_segments(&c.file, Some(c.language))
 }
 
 /// A file's module identity as path segments: directory components plus the
@@ -714,6 +714,14 @@ fn candidate_segments(c: &Cand) -> Vec<String> {
 /// directory. (`lib.rs` is deliberately NOT remapped: a python `pkg/lib.py`
 /// is a real module named `lib`, not the directory's package root.)
 fn file_module_segments(path: &str) -> Vec<String> {
+    module_segments(path, None)
+}
+
+/// [`file_module_segments`] with language awareness: a Rust crate-root file
+/// (`src/lib.rs`, `src/main.rs`) IS the crate root directory's module, not a
+/// module named `lib`/`main` beside it. (Python `pkg/lib.py` stays a real
+/// module named `lib`.)
+fn module_segments(path: &str, lang: Option<Language>) -> Vec<String> {
     let fname = path.rsplit(['/', '\\']).next().unwrap_or(path);
     // Strip only the final extension: `b.test.ts` stems to `b.test`.
     let stem = match fname.rsplit_once('.') {
@@ -726,8 +734,13 @@ fn file_module_segments(path: &str) -> Vec<String> {
         .map(String::from)
         .collect();
     segs.pop(); // the filename itself
-    if matches!(stem, "mod" | "__init__" | "index") && !segs.is_empty() {
-        return segs;
+    if !segs.is_empty() {
+        if matches!(stem, "mod" | "__init__" | "index") {
+            return segs;
+        }
+        if lang == Some(Language::Rust) && matches!(stem, "lib" | "main") {
+            return segs; // the crate-root file is the root directory's module
+        }
     }
     segs.push(stem.to_string());
     segs
@@ -774,7 +787,7 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         }
     }
     if caller_relative {
-        let mut caller_segs = file_module_segments(caller.file);
+        let mut caller_segs = module_segments(caller.file, Some(caller.language));
         if supers > 0 {
             if caller_segs.len() < supers {
                 return false; // `super::` past the repository root
@@ -794,21 +807,23 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
     }
 
     if parent.is_empty() {
-        // An empty scope is the crate root. A *symbol* import (`crate::B`)
-        // binds only a symbol in a crate-root file (src/lib.rs,
-        // src/main.rs) — not a namesake in an unrelated module. A *module*
-        // import (`use crate::a;`) binds the module named by the final
-        // segment (src/a.rs).
+        // An empty scope is the CALLER's crate root. A *symbol* import
+        // (`crate::B`) binds only a symbol in the caller's own crate-root
+        // file (src/lib.rs, src/main.rs) — not a namesake in an unrelated
+        // module or another workspace crate. A *module* import
+        // (`use crate::a;`) binds the module directly under that root.
+        let prefix = crate_root_prefix(caller.file);
+        let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+        let csegs = candidate_segments(c);
+        if !csegs.starts_with(&prefix[..]) {
+            return false; // another crate's tree (workspace sibling)
+        }
         let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
-        if matches!(root_file, "lib.rs" | "main.rs") {
+        if csegs.len() == pref.len() && matches!(root_file, "lib.rs" | "main.rs") {
             return true;
         }
-        // A root-level module lives directly under the caller's crate root
-        // (`src/a.rs` for a src/-rooted crate), never nested elsewhere.
-        let prefix = crate_root_prefix(caller.file);
-        let csegs = candidate_segments(c);
         return c.kind == SymbolKind::Module
-            && csegs.len() == prefix.len() + 1
+            && csegs.len() == pref.len() + 1
             && csegs.last().is_some_and(|s| s == name);
     }
     let parent: Vec<&str> = parent.iter().map(|s| s.as_str()).collect();
@@ -1885,6 +1900,86 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("src/sub/b.h wins")).unwrap();
         assert_eq!(target.file, "src/sub/b.h");
+    }
+
+    #[test]
+    fn crate_root_symbol_does_not_cross_workspace_crates() {
+        // `crate::B` from crates/foo must not bind the sibling crate's
+        // root file when its own has no B.
+        let g = graph(&[
+            (
+                "crates/foo/src/x.rs",
+                "use crate::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("crates/bar/src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "crates/foo/src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "crate::B must not bind the sibling crate's lib.rs"
+        );
+    }
+
+    #[test]
+    fn crate_root_symbol_binds_own_root_file() {
+        let g = graph(&[
+            (
+                "crates/foo/src/x.rs",
+                "use crate::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("crates/foo/src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "crates/foo/src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("own crate root binds")).unwrap();
+        assert_eq!(target.file, "crates/foo/src/lib.rs");
+    }
+
+    #[test]
+    fn self_scoped_from_root_file_reaches_submodules() {
+        // `self::child::B` from src/lib.rs scopes to the crate root, so
+        // src/child.rs qualifies (lib.rs is the root module, not a module
+        // named `lib` beside it).
+        let g = graph(&[
+            (
+                "src/lib.rs",
+                "use self::child::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("src/child.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/lib.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("self::child binds src/child.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/child.rs");
+    }
+
+    #[test]
+    fn self_scoped_from_main_binds_lib_root() {
+        // src/main.rs and src/lib.rs are both the crate root: `self::B`
+        // from main.rs may bind lib.rs's B.
+        let g = graph(&[
+            ("src/main.rs", "use self::B;\nfn main() { let _b: B; }\n"),
+            ("src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("self::B binds the lib root")).unwrap();
+        assert_eq!(target.file, "src/lib.rs");
     }
 
     #[test]
