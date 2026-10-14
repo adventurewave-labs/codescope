@@ -33,29 +33,33 @@ Import edges get their own resolution path, separate from call-edge scoring:
    exact basename (same-directory files win ties). `#include <stdio.h>` stays
    unbound unless a `stdio.h` exists in the repo.
 2. **Module-naming imports** — `b`, `./b`, `app.store.Repo`,
-   `crate::fresh::LiveGraph`. Three guards:
+   `crate::fresh::LiveGraph`. Four guards:
    - **Language families.** Candidates outside the caller's language family
      are never considered (JS⇄TS and C⇄C++ are one family each; a Python
-     import can never mean a C++ header). Evidence is family-scoped too — one
-     language's directories cannot vouch for another's import.
-   - **In-repo evidence for qualified paths.** `::`-separated (Rust-style)
-     paths bind when any non-empty suffix of the parent chain names a real
-     rooted directory chain or module stem (the crate-name prefix need not
-     match the on-disk path: `codescope::fresh::LiveGraph` passes on `fresh`).
-     Dotted/slash package paths require the **full** parent chain to exist as
-     a rooted directory chain (`app/store` passes when that directory exists).
-     A single colliding segment is deliberately not evidence: `java.util.List`
-     stays unbound even in a repo that has a `java` directory, because
-     `java/util` is not a chain in it. `std::process::Command` names nothing
-     in-repo and stays unbound rather than capturing an in-repo `Command`
-     namesake. `crate`/`self`/`super` are always in-repo; relative imports
-     (`./x`, `../x`) are in-repo by construction.
+     import can never mean a C++ header). Every shape enforces this,
+     including file-naming includes.
+   - **Relative imports resolve as paths, not names.** `"./b"` and
+     `"../lib/b"` are normalized against the importing file's directory
+     (`..` applied) and must match the module's file exactly — a same-named
+     module in the importer's own directory cannot capture a
+     `"../lib/b"`. TS NodeNext's `"./b.js"` retries without the JS
+     extension, resolving to `b.ts`.
+   - **Per-candidate evidence for qualified paths.** The parent path must be
+     a suffix of the *candidate's own* path, so evidence is coupled to the
+     target: `crate::a::B` binds a `B` only inside module `a`, and
+     `app.store.Repo` binds only under an `app/store` directory. Rust's
+     prelude roots (`std`, `core`, `alloc`) are never in-repo — `std::sync::
+     Arc` stays unbound even when the repo has a `sync.rs`. A single
+     colliding directory name is never evidence: `java.util.List` stays
+     unbound beside a `java/` directory because no candidate sits under a
+     `java/util` chain. `crate`/`self`/`super` prove in-repo-ness but are
+     dropped before matching, so they do not bypass the module constraint.
    - **Bare imports bind modules only.** A single-segment import (`import b`,
      `import time`, `use serde;`) may bind only a module-kind symbol — a
      same-named function in another file never captures it.
 
-Import edges prefer module-kind targets (+6 in scoring); same-directory
-candidates get +4.
+Qualified-import candidates prefer module-kind targets (+6 in scoring);
+same-directory candidates get +4. A file never binds an import to itself.
 
 ## Consequences
 
@@ -64,8 +68,9 @@ candidates get +4.
   Python/Ruby module cycles.
 - Polyglot repos no longer cross-bind imports between languages.
 - External qualified imports stay unbound instead of capturing in-repo
-  namesakes; `summary`'s "call resolution" bound-count on codescope's own
-  source went 629/2950 → 660/3052 (bound, honest edges only).
+  namesakes; on codescope's own source the `std::` imports stay unbound while
+  every `crate::`-qualified one binds, so the summary's bound-count gains only
+  real edges.
 - `find` relevance improved as a side effect (MRR 0.693 → 0.730): resolved
   import edges feed import-aware scoring and centrality.
 - The 85-site call-resolution eval is unchanged (1.00 / 0.97 / 0.98) — call

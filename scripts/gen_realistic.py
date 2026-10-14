@@ -2,7 +2,8 @@
 """Realistic synthetic-repo generator (docs/BENCHMARKS.md methodology).
 
 Functions with doc comments, input validation, loops and ~9 cross-file call
-sites each (~18 LOC/symbol) — closer to real Rust than the dense corpus.
+sites each (21 lines per function, ~21 LOC/symbol) — closer to real Rust
+than the dense corpus.
 
 Usage: gen_realistic.py [out_dir] [n_files] [n_fns]
 Defaults reproduce a ~1M-LOC corpus: 1,400 files x 39 fns.

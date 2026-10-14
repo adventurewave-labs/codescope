@@ -25,6 +25,9 @@ struct Cand {
     /// `pkg/store/x.go`) — module-qualifier matching.
     stem: String,
     dir: String,
+    /// Full parent path (`src/interfaces` for `src/interfaces/mcp.rs`) —
+    /// import-path evidence.
+    dir_path: String,
     owner: Option<String>,
     language: Language,
 }
@@ -123,43 +126,20 @@ fn resolve_in(graph: &mut CodeGraph, scope: Option<&Scope>) {
     // Module symbols keyed by their file's basename — for imports that name a
     // file outright (`#include "list.h"`, `from "./b.ts"`).
     let mut by_basename: HashMap<&str, Vec<Cand>> = HashMap::new();
-    // In-repo evidence for qualified import paths, per language family:
-    // every rooted directory chain the family contains (`src`,
-    // `src/interfaces`, `tests/eval/java/app`) plus every file stem. A
-    // qualified import (`crate::fresh::LiveGraph`, `app.store.Repo`) may
-    // only bind when its parent path is proven against these — `std::process`
-    // and `java.util` name no chain or stem we have. Family scoping keeps one
-    // language's directories from vouching for another's imports.
-    let mut family_dirs: HashMap<u8, std::collections::HashSet<String>> = HashMap::new();
-    let mut family_stems: HashMap<u8, std::collections::HashSet<String>> = HashMap::new();
     for s in graph.symbols() {
-        let fam = lang_family(s.language);
-        let parts: Vec<&str> = s
-            .file
-            .split(['/', '\\'])
-            .filter(|p| !p.is_empty())
-            .collect();
-        let mut acc = String::new();
-        for p in &parts[..parts.len().saturating_sub(1)] {
-            if !acc.is_empty() {
-                acc.push('/');
-            }
-            acc.push_str(p);
-            family_dirs.entry(fam).or_default().insert(acc.clone());
-        }
-        if let Some(fname) = parts.last() {
-            family_stems
-                .entry(fam)
-                .or_default()
-                .insert(fname.split('.').next().unwrap_or(fname).to_string());
-        }
         let (stem, dir) = stem_and_dir(&s.file);
+        let dir_path = s
+            .file
+            .rsplit_once(['/', '\\'])
+            .map(|(d, _)| d.to_string())
+            .unwrap_or_default();
         let cand = Cand {
             id: s.id,
             kind: s.kind,
             file: s.file.clone(),
             stem,
             dir,
+            dir_path,
             owner: s.owner.clone(),
             language: s.language,
         };
@@ -212,14 +192,7 @@ fn resolve_in(graph: &mut CodeGraph, scope: Option<&Scope>) {
             };
             let file_imports = imports.get(src.file.as_str()).unwrap_or(&no_imports);
             let bound = if edge.kind == EdgeKind::Imports {
-                resolve_import(
-                    edge,
-                    &caller,
-                    &name_index,
-                    &by_basename,
-                    &family_dirs,
-                    &family_stems,
-                )
+                resolve_import(edge, &caller, &name_index, &by_basename)
             } else {
                 resolve_one(edge, &caller, file_imports, &name_index)
             };
@@ -229,8 +202,6 @@ fn resolve_in(graph: &mut CodeGraph, scope: Option<&Scope>) {
     drop(name_index);
     drop(imports);
     drop(by_basename);
-    drop(family_dirs);
-    drop(family_stems);
 
     let edges = graph.edges_mut();
     for (i, to, alternatives) in bindings {
@@ -465,43 +436,64 @@ fn dir_of(path: &str) -> &str {
 
 /// Bind an `Imports` edge to the module symbol of the file it names.
 ///
-/// Two shapes, both conservative (ADR-0023):
+/// Every shape is conservative (ADR-0023): candidates are always confined to
+/// the caller's language family and never include the importing file itself.
+///
 /// * **File-naming imports** — the string carries a code extension
 ///   (`"list.h"`, `"./b.ts"`). Bind the module symbol of the file with that
 ///   exact basename; same-directory files win ties. `#include <stdio.h>`
-///   stays unbound unless a `stdio.h` actually exists in the repo.
-/// * **Module-naming imports** — `b`, `./b`, `app.store.Repo`,
-///   `crate::fresh::LiveGraph`. Normalize to the last `::`/`.` segment and
-///   match symbol names, but only within the caller's language family, so a
-///   polyglot repo cannot cross-bind (`import b` in `py/a.py` binds
-///   `py/b.py`, never `cpp/b.hpp`). Qualified paths additionally need
-///   in-repo evidence (see below), and bare single-segment imports bind
-///   module symbols only — an `import time` never captures a same-named
-///   function.
+///   stays unbound unless a `stdio.h` actually exists in the repo. TS
+///   NodeNext-style `"./b.js"` (which means `b.ts`) retries without the JS
+///   extension as a relative module path.
+/// * **Relative module imports** — `"./b"`, `"../lib/b"`. Resolved as an
+///   exact path against the importing file's directory (`..` components
+///   applied), matching the module whose file lives there — never a
+///   same-named module elsewhere.
+/// * **Qualified imports** — `app.store.Repo`, `crate::fresh::LiveGraph`.
+///   The parent path must be proven *per candidate*: the candidate's own
+///   path must end with the parent chain (dotted/slash) or with a suffix of
+///   it (`::`-paths, where the crate-name prefix need not match the disk
+///   layout), so `crate::a::B` cannot bind a `B` that lives outside `a`.
+///   Rust's prelude roots (`std`, `core`, `alloc`) are never in-repo.
+/// * **Bare imports** — `b`, `import time`, `use serde;`. Single-segment
+///   names bind module symbols only, never a same-named function.
 fn resolve_import(
     edge: &Edge,
     caller: &Caller,
     name_index: &HashMap<&str, Vec<Cand>>,
     by_basename: &HashMap<&str, Vec<Cand>>,
-    family_dirs: &HashMap<u8, std::collections::HashSet<String>>,
-    family_stems: &HashMap<u8, std::collections::HashSet<String>>,
 ) -> Option<(SymbolId, u16)> {
     let raw = edge
         .to_name
         .trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
     let relative = raw.starts_with("./") || raw.starts_with("../");
-    let seg = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let mut eff = raw;
 
-    // Shape 1: the import names a file (`list.h`). Only a file with that
-    // exact basename can match, which keeps system includes unbound.
-    if let Some((_, ext)) = seg.rsplit_once('.') {
-        if is_code_extension(ext) {
-            let cands = by_basename.get(seg)?;
+    // Shape 1: the import names a file (`list.h`). Only a module in a file
+    // with that exact basename can match, which keeps system includes
+    // unbound.
+    'shape1: {
+        let seg = eff.rsplit(['/', '\\']).next().unwrap_or(eff);
+        let Some((_, ext)) = seg.rsplit_once('.') else {
+            break 'shape1;
+        };
+        if !is_code_extension(ext) {
+            break 'shape1;
+        }
+        if let Some(cands) = by_basename.get(seg) {
             let mut best: Option<(SymbolId, u32)> = None;
             let mut ties = 0u16;
             for c in cands {
+                if c.id == edge.from {
+                    continue; // a file never includes itself
+                }
+                if lang_family(c.language) != lang_family(caller.language) {
+                    continue;
+                }
                 // Prefer resolving against the importing file's own directory
                 // (how C/C++ `#include "..."` and relative TS imports resolve).
+                // `c.dir` is the last directory segment — see `stem_and_dir`;
+                // `dir_of` mirrors that contract.
                 let score = 1 + u32::from(c.dir == dir_of(caller.file)) * 8;
                 match best {
                     Some((_, b)) if b > score => {}
@@ -514,73 +506,92 @@ fn resolve_import(
             }
             return best.map(|(id, _)| (id, ties));
         }
+        // No file of that basename: TS NodeNext writes `"./b.js"` while
+        // meaning `b.ts` — retry as a relative module path without the
+        // extension. Anything else names a file we simply do not have.
+        if relative && matches!(ext, "js" | "mjs" | "cjs" | "jsx") {
+            eff = &eff[..eff.len() - ext.len() - 1];
+        } else {
+            return None;
+        }
     }
 
-    // Shape 2: the import names a module/symbol. Normalize `crate::a::B`,
-    // `app.store.Repo`, `./b` down to the candidate name.
+    // Shape 2: the import names a module (or, for qualified `::` paths, a
+    // symbol inside one). Normalize `crate::a::B`, `app.store.Repo`, `./b`
+    // down to the candidate name.
+    let seg = eff.rsplit(['/', '\\']).next().unwrap_or(eff);
     let name = seg
         .rsplit("::")
         .next()
         .and_then(|s| s.rsplit('.').next())
         .unwrap_or(seg);
-    let segments: Vec<&str> = raw
+    let segments: Vec<&str> = eff
         .split([':', '.', '/', '\\', ' '])
         .filter(|s| !s.is_empty())
         .collect();
-    let qualified = !relative && segments.len() > 1;
+    let cands = name_index.get(name)?;
 
-    // A qualified path must prove it is in-repo before any candidate is
-    // considered, and the evidence is scoped to the caller's language family
-    // (one language's directories cannot vouch for another's import):
-    // * `::`-separated (Rust-style) — a crate-name prefix need not match the
-    //   on-disk path, so any non-empty suffix of the parent chain may name a
-    //   real directory chain or module stem: `codescope::fresh::LiveGraph`
-    //   passes on `fresh` (src/fresh.rs), `std::process::Command` names
-    //   nothing we have.
-    // * dotted/slash package paths — the full parent chain must be a real
-    //   rooted directory chain: `app/store` passes when that directory
-    //   exists, `java.util` fails even in a repo with a `java` directory
-    //   (the chain `java/util` does not exist).
-    // `crate`/`self`/`super` are Rust self-references and always in-repo.
-    if qualified {
-        let parent = &segments[..segments.len() - 1];
-        let proven = parent
-            .iter()
-            .any(|s| matches!(*s, "crate" | "self" | "super"))
-            || if raw.contains("::") {
-                let fam = lang_family(caller.language);
-                (1..=parent.len()).any(|i| {
-                    let suf = parent[i - 1..].join("/");
-                    family_dirs.get(&fam).is_some_and(|d| d.contains(&suf))
-                        || family_stems.get(&fam).is_some_and(|st| st.contains(&suf))
-                })
-            } else {
-                let chain = parent.join("/");
-                family_dirs
-                    .get(&lang_family(caller.language))
-                    .is_some_and(|d| d.contains(&chain))
-            };
-        if !proven {
-            return None;
+    // Relative imports resolve as exact paths against the importer's
+    // directory — `../lib/b` from `c/d/x.ts` means `c/lib/b`, not whichever
+    // module is named `b` nearest by name.
+    if relative {
+        let mut target: Vec<String> = caller
+            .file
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(String::from)
+            .collect();
+        target.pop(); // the importing file itself
+        for t in eff.split(['/', '\\']).filter(|s| !s.is_empty()) {
+            match t {
+                ".." => {
+                    target.pop();
+                }
+                "." => {}
+                t => target.push(t.to_string()),
+            }
         }
+        let mut best: Option<(SymbolId, u32)> = None;
+        let mut ties = 0u16;
+        for c in cands {
+            if c.id == edge.from || lang_family(c.language) != lang_family(caller.language) {
+                continue;
+            }
+            if c.kind != SymbolKind::Module {
+                continue; // a relative path names a file/module, not a symbol
+            }
+            if candidate_segments(c) != target {
+                continue;
+            }
+            let score = 1;
+            match best {
+                Some((_, b)) if b == score => ties += 1,
+                _ => {
+                    best = Some((c.id, score));
+                    ties = 0;
+                }
+            }
+        }
+        return best.map(|(id, _)| (id, ties));
     }
 
-    // A bare (or relative) import names a *module*, never a symbol: an
-    // `import time` must not capture a same-named function.
-    let module_only = !qualified;
-    let cands = name_index.get(name)?;
+    let qualified = segments.len() > 1;
+    if qualified && matches!(segments.first(), Some(&"std") | Some(&"core") | Some(&"alloc")) {
+        return None; // Rust prelude roots are never in-repo
+    }
+
     let mut best: Option<(SymbolId, u32)> = None;
     let mut ties = 0u16;
     for c in cands {
-        if c.id == edge.from {
+        if c.id == edge.from || lang_family(c.language) != lang_family(caller.language) {
             continue;
         }
-        // Imports are language-local: never bind across language families.
-        if lang_family(c.language) != lang_family(caller.language) {
-            continue;
-        }
-        if module_only && c.kind != SymbolKind::Module {
-            continue;
+        if qualified {
+            if !proven_for_candidate(&segments, c) {
+                continue;
+            }
+        } else if c.kind != SymbolKind::Module {
+            continue; // a bare import names a module, never a function
         }
         let mut score = 1;
         if c.kind == SymbolKind::Module {
@@ -602,6 +613,62 @@ fn resolve_import(
         }
     }
     best.map(|(id, _)| (id, ties))
+}
+
+/// The candidate's path as segments, file stem for the final component
+/// (`src/fresh.rs` → ["src", "fresh"]).
+fn candidate_segments(c: &Cand) -> Vec<String> {
+    let fname = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
+    let stem = fname.split('.').next().unwrap_or(fname);
+    let mut segs: Vec<String> = c
+        .dir_path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if matches!(stem, "mod" | "__init__" | "index" | "lib") && !segs.is_empty() {
+        return segs; // the module is named by its directory
+    }
+    segs.push(stem.to_string());
+    segs
+}
+
+/// Per-candidate in-repo evidence for a qualified import path: the parent
+/// chain must be a suffix of the candidate's own path.
+///
+/// * `::`-separated (Rust-style): the crate-name prefix need not match the
+///   on-disk layout, so any non-empty suffix of the parent chain suffices —
+///   `codescope::fresh::LiveGraph` passes on `fresh`. `crate`/`self`/`super`
+///   prove in-repo-ness but are dropped before matching, so `crate::a::B`
+///   still requires the candidate to live under `a`.
+/// * dotted/slash package paths: the full parent chain must be a path
+///   suffix — `app.store.Repo` passes for `app/store/Repo.java`, while
+///   `java.util.List` fails even beside a `java/` directory (there is no
+///   `java/util` chain above the candidate).
+fn proven_for_candidate(segments: &[&str], c: &Cand) -> bool {
+    let parent = &segments[..segments.len() - 1];
+    let parent: Vec<&str> = parent
+        .iter()
+        .skip_while(|s| matches!(**s, "crate" | "self" | "super"))
+        .copied()
+        .collect();
+    if parent.is_empty() {
+        return true; // `crate::resolve` — proven, module named outright
+    }
+    let csegs = candidate_segments(c);
+    let csegs: Vec<&str> = csegs.iter().map(|s| s.as_str()).collect();
+    if csegs.len() < parent.len() {
+        return false;
+    }
+    let joined = segments.join("");
+    if joined.contains("::") || segments.iter().any(|s| *s == "crate") {
+        (1..=parent.len()).any(|i| csegs.ends_with(&parent[i - 1..]))
+    } else {
+        // Dotted package paths name the package the class lives in: the
+        // parent chain must be a suffix of the candidate's directory, with
+        // the file itself beyond it.
+        csegs.len() > parent.len() && csegs[..csegs.len() - 1].ends_with(&parent[..])
+    }
 }
 
 #[cfg(test)]
@@ -1061,10 +1128,7 @@ mod tests {
         let g = graph(&[
             ("lib/util/head.h", "int lu(void);\n"),
             ("c/d/head.h", "int cd(void);\n"),
-            (
-                "c/d/main.c",
-                "#include \"head.h\"\nint main(void) { return 0; }\n",
-            ),
+            ("c/d/main.c", "#include \"head.h\"\nint main(void) { return 0; }\n"),
         ]);
         let from = module_of(&g, "c/d/main.c");
         let e = g
@@ -1073,5 +1137,93 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("head.h resolves")).unwrap();
         assert_eq!(target.file, "c/d/head.h");
+    }
+    #[test]
+    fn relative_imports_apply_dotdot_components() {
+        // `../lib/b` from c/d/x.ts means c/lib/b — not the same-named module
+        // sitting in the importer's own directory.
+        let g = graph(&[
+            ("c/d/x.ts", "import { b } from \"../lib/b\";\nexport function x() { return b(); }\n"),
+            ("c/d/b.ts", "export function b() { return 1; }\n"),
+            ("c/lib/b.ts", "export function b() { return 2; }\n"),
+        ]);
+        let from = module_of(&g, "c/d/x.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("../lib/b resolves")).unwrap();
+        assert_eq!(target.file, "c/lib/b.ts");
+    }
+
+    #[test]
+    fn nodenext_js_extension_resolves_to_ts() {
+        let g = graph(&[
+            ("a.ts", "import { b } from \"./b.js\";\nexport function a() { return b(); }\n"),
+            ("b.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("./b.js means b.ts")).unwrap();
+        assert_eq!(target.file, "b.ts");
+    }
+
+    #[test]
+    fn crate_qualified_symbol_binds_only_inside_its_module() {
+        // `crate::a::B` must not capture a same-named B that lives outside
+        // module `a`, even though both are in-repo.
+        let g = graph(&[
+            ("src/x.rs", "use crate::a::B;\nfn main() { let _b: B; }\n"),
+            ("src/a.rs", "pub struct B;\n"),
+            ("src/b.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("B binds inside module a")).unwrap();
+        assert_eq!(target.file, "src/a.rs");
+    }
+
+    #[test]
+    fn std_path_with_in_repo_stem_stays_unbound() {
+        // An in-repo `sync.rs` must not vouch for `std::sync::Arc`.
+        let g = graph(&[
+            ("src/x.rs", "use std::sync::Arc;\nfn main() { let _a: Arc; }\n"),
+            ("src/sync.rs", "pub struct Arc;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "std:: paths are never in-repo");
+    }
+
+    #[test]
+    fn dotted_package_import_binds_under_nested_root() {
+        // A real package chain (`app/store`) deep in the tree binds even
+        // though it is not rooted at the repo root.
+        let g = graph(&[
+            (
+                "tests/eval/java/app/store/Repo.java",
+                "package app.store;\npublic class Repo {}\n",
+            ),
+            (
+                "tests/eval/java/app/svc/Svc.java",
+                "package app.svc;\nimport app.store.Repo;\npublic class Svc { Repo r; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "tests/eval/java/app/svc/Svc.java");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name.contains("Repo"))
+            .unwrap();
+        let target = g.symbol(e.to.expect("app.store.Repo binds")).unwrap();
+        assert_eq!(target.file, "tests/eval/java/app/store/Repo.java");
     }
 }

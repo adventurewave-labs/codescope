@@ -161,7 +161,7 @@ Measured on a 4-core container (release build) — see [`docs/BENCHMARKS.md`](do
   see ADR-0020).
 - In-process query latency **< 2 ms** for every query type on that hardware —
   graph traversals are µs-scale; the two full-scan queries (`search`,
-  `summary`) land at ~1.4–1.7 ms on 4 cores and ~3–7 ms on 2 cores.
+  `summary`) land at ~1.4–1.7 ms on 4 cores and ~1.2–6.8 ms on 2 cores.
 - On-disk index size is the one PRD target not met (~75% vs. <15%); the cause
   and remediation are documented honestly in the benchmarks doc and ADR-0005.
 
