@@ -25,9 +25,6 @@ struct Cand {
     /// `pkg/store/x.go`) — module-qualifier matching.
     stem: String,
     dir: String,
-    /// Full parent path (`src/interfaces` for `src/interfaces/mcp.rs`) —
-    /// import-path evidence.
-    dir_path: String,
     owner: Option<String>,
     language: Language,
 }
@@ -128,18 +125,12 @@ fn resolve_in(graph: &mut CodeGraph, scope: Option<&Scope>) {
     let mut by_basename: HashMap<&str, Vec<Cand>> = HashMap::new();
     for s in graph.symbols() {
         let (stem, dir) = stem_and_dir(&s.file);
-        let dir_path = s
-            .file
-            .rsplit_once(['/', '\\'])
-            .map(|(d, _)| d.to_string())
-            .unwrap_or_default();
         let cand = Cand {
             id: s.id,
             kind: s.kind,
             file: s.file.clone(),
             stem,
             dir,
-            dir_path,
             owner: s.owner.clone(),
             language: s.language,
         };
@@ -612,7 +603,7 @@ fn resolve_import(
             continue;
         }
         if qualified {
-            if !proven_for_candidate(eff, &segments, c) {
+            if !proven_for_candidate(eff, &segments, c, caller) {
                 continue;
             }
         } else if c.kind != SymbolKind::Module {
@@ -666,21 +657,26 @@ fn relative_components(raw: &str, caller_file: &str) -> Option<Vec<String>> {
 /// The candidate's path as segments, file stem for the final component
 /// (`src/fresh.rs` → ["src", "fresh"]).
 fn candidate_segments(c: &Cand) -> Vec<String> {
-    let fname = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
+    file_module_segments(&c.file)
+}
+
+/// A file's module identity as path segments: directory components plus the
+/// file stem, with `mod.rs` / `__init__.py` / `index.ts` named by their
+/// directory. (`lib.rs` is deliberately NOT remapped: a python `pkg/lib.py`
+/// is a real module named `lib`, not the directory's package root.)
+fn file_module_segments(path: &str) -> Vec<String> {
+    let fname = path.rsplit(['/', '\\']).next().unwrap_or(path);
     // Strip only the final extension: `b.test.ts` stems to `b.test`.
     let stem = match fname.rsplit_once('.') {
         Some((s, e)) if is_code_extension(e) => s,
         _ => fname.split('.').next().unwrap_or(fname),
     };
-    let mut segs: Vec<String> = c
-        .dir_path
+    let mut segs: Vec<String> = path
         .split(['/', '\\'])
         .filter(|s| !s.is_empty())
         .map(String::from)
         .collect();
-    // `mod.rs` / `__init__.py` / `index.ts` are named by their directory.
-    // (`lib.rs` is deliberately NOT remapped: a python `pkg/lib.py` is a real
-    // module named `lib`, not the directory's package root.)
+    segs.pop(); // the filename itself
     if matches!(stem, "mod" | "__init__" | "index") && !segs.is_empty() {
         return segs;
     }
@@ -689,27 +685,63 @@ fn candidate_segments(c: &Cand) -> Vec<String> {
 }
 
 /// Per-candidate in-repo evidence for a qualified import path: the parent
-/// chain must be a suffix of the candidate's own path.
+/// chain must anchor at the candidate's own path.
 ///
-/// * `::`-separated (Rust-style): the crate-name prefix need not match the
-///   on-disk layout, so any non-empty suffix of the parent chain suffices —
-///   `codescope::fresh::LiveGraph` passes on `fresh`. `crate`/`self`/`super`
-///   prove in-repo-ness but are dropped before matching, so `crate::a::B`
-///   still requires the candidate to live under `a`.
+/// * `::`-separated (Rust-style): the full parent chain (after any
+///   `crate::` root) must be a path suffix of the candidate — or, for a
+///   *module* import (`use crate::a::b`), the chain including the final
+///   name. `self::`/`super::` are caller-relative and anchor to the
+///   importing file's own module ancestry, so `self::B` cannot bind a `B`
+///   from an unrelated module.
 /// * dotted/slash package paths: the full parent chain must be a path
-///   suffix — `app.store.Repo` passes for `app/store/Repo.java`, while
-///   `java.util.List` fails even beside a `java/` directory (there is no
-///   `java/util` chain above the candidate).
-fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand) -> bool {
-    let parent = &segments[..segments.len() - 1];
-    let parent: Vec<&str> = parent
+///   suffix of the candidate's directory — `app.store.Repo` passes for
+///   `app/store/Repo.java`, while `java.util.List` fails even beside a
+///   `java/` directory (there is no `java/util` chain above the candidate).
+fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller) -> bool {
+    let name = segments[segments.len() - 1];
+    let mut parent: Vec<String> = segments[..segments.len() - 1]
         .iter()
-        .skip_while(|s| matches!(**s, "crate" | "self" | "super"))
-        .copied()
+        .map(|s| s.to_string())
         .collect();
+
+    // `crate::` is root-relative; `self::`/`super::` are caller-relative —
+    // dropping them without anchoring would let `self::B` bind any
+    // same-named symbol in the language.
+    let mut supers = 0usize;
+    let mut caller_relative = false;
+    while matches!(
+        parent.first().map(|s| s.as_str()),
+        Some("crate") | Some("self") | Some("super")
+    ) {
+        match parent.remove(0).as_str() {
+            "super" => {
+                supers += 1;
+                caller_relative = true;
+            }
+            "self" => caller_relative = true,
+            _ => {} // `crate::` is root-relative, not caller-relative
+        }
+    }
+    if caller_relative {
+        let mut caller_segs = file_module_segments(caller.file);
+        if supers > 0 {
+            if caller_segs.len() < supers {
+                return false; // `super::` past the repository root
+            }
+            caller_segs.truncate(caller_segs.len() - supers);
+        }
+        // `self::` at a root module and `super::` that climbed to the root
+        // both leave the root itself as scope; an empty scope binds nothing.
+        if caller_segs.is_empty() {
+            return false;
+        }
+        parent = caller_segs;
+    }
+
     if parent.is_empty() {
         return true; // `crate::resolve` — proven, module named outright
     }
+    let parent: Vec<&str> = parent.iter().map(|s| s.as_str()).collect();
     let csegs = candidate_segments(c);
     let csegs: Vec<&str> = csegs.iter().map(|s| s.as_str()).collect();
     if csegs.len() < parent.len() {
@@ -719,10 +751,17 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand) -> bool {
         // The full parent chain must anchor at the candidate: a shorter
         // suffix would let `crate::a::b::B` bind any `B` under a `b.rs`
         // anywhere, or `serde::de::Deserialize` capture a namesake in a
-        // local `de.rs`. (Cost: an import qualified by the crate's own
-        // *name* — `codescope::fresh::LiveGraph` from inside `codescope` —
-        // stays unbound; use `crate::`-style paths.)
-        csegs.ends_with(&parent[..])
+        // local `de.rs`. For a *module* import (`use crate::a::b`) the final
+        // name is itself part of the module path, so `parent + name` is also
+        // an acceptable anchor. (Cost: an import qualified by the crate's
+        // own *name* — `codescope::fresh::LiveGraph` from inside `codescope`
+        // — stays unbound; use `crate::`-style paths.)
+        if csegs.ends_with(&parent[..]) {
+            return true;
+        }
+        let mut chain: Vec<&str> = parent.clone();
+        chain.push(name);
+        csegs.ends_with(&chain)
     } else {
         // Dotted package paths name the package the class lives in: the
         // parent chain must be a suffix of the candidate's directory, with
@@ -1444,6 +1483,61 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("core.utils binds in Python")).unwrap();
         assert_eq!(target.file, "core/utils.py");
+    }
+
+    #[test]
+    fn nested_module_import_binds() {
+        // `use crate::a::b;` imports a MODULE: the final name is part of the
+        // module path, not a symbol inside `a`.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a::b;\nfn main() { let _t: b::Thing; }\n",
+            ),
+            ("src/a/b.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("crate::a::b binds")).unwrap();
+        assert_eq!(target.file, "src/a/b.rs");
+    }
+
+    #[test]
+    fn self_scoped_import_stays_in_the_callers_module() {
+        // `self::B` must bind only within the caller's own module — not a
+        // same-named B in an unrelated file.
+        let g = graph(&[
+            ("src/a.rs", "use self::B;\nfn run() { let _b: B; }\n"),
+            ("src/unrelated.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/a.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "self::B with no local B must not bind src/unrelated.rs"
+        );
+    }
+
+    #[test]
+    fn super_scoped_import_binds_the_parent_module() {
+        let g = graph(&[
+            ("src/a/b.rs", "use super::B;\npub fn run() { let _b: B; }\n"),
+            ("src/a.rs", "pub struct B;\n"),
+            ("src/other.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/a/b.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("super::B binds src/a.rs")).unwrap();
+        assert_eq!(target.file, "src/a.rs");
     }
 
     #[test]
