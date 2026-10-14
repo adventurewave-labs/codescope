@@ -420,6 +420,20 @@ fn lang_family(lang: Language) -> u8 {
     }
 }
 
+/// The caller's crate-root prefix: path components up to and including the
+/// last `src` directory (`crates/foo/src` for `crates/foo/src/x.rs`; empty
+/// for a crate rooted at the repository root).
+fn crate_root_prefix(caller_file: &str) -> Vec<String> {
+    let parts: Vec<&str> = caller_file
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    match parts.iter().rposition(|s| *s == "src") {
+        Some(i) if i + 1 < parts.len() => parts[..=i].iter().map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// The full parent path of a file (`py/sub` for `py/sub/a.py`, "" at the
 /// root) — directory affinity must compare whole paths, not just the final
 /// segment, or `app/include/` and `vendor/include/` look alike.
@@ -523,14 +537,19 @@ fn resolve_import(
                     .join("/");
                 let on_path =
                     c.file == full || (full.contains('/') && c.file.ends_with(&format!("/{full}")));
+                // The importer-relative target (`sub/b.h` from src/main.c
+                // means src/sub/b.h) outranks the same suffix at the repo
+                // root — C searches the includer's directory first.
+                let local_target = match parent_path(caller.file) {
+                    "" => full.to_string(),
+                    d => format!("{d}/{full}"),
+                };
+                let local_hit = c.file == local_target;
                 if full.contains('/') && !on_path {
                     continue; // `sub/b.h` never means an unrelated same-basename file
                 }
-                // C `#include "..."` searches the importer's directory
-                // FIRST, then the include path — so a header beside the
-                // importer outranks a same-basename file at the named path
-                // root.
                 let score = 1
+                    + u32::from(local_hit) * 48
                     + u32::from(parent_path(&c.file) == parent_path(caller.file)) * 32
                     + u32::from(on_path) * 16;
                 match best {
@@ -569,11 +588,25 @@ fn resolve_import(
         .split([':', '.', '/', '\\', ' '])
         .filter(|s| !s.is_empty())
         .collect();
-    let cands = name_index.get(name)?;
-
     // Relative imports resolve as exact paths against the importer's
     // directory — `../lib/b` from `c/d/x.ts` means `c/lib/b`, not whichever
     // module is named `b` nearest by name.
+    let mut cand_vec: Vec<&Cand> = name_index
+        .get(name)
+        .map(|v| v.iter().collect())
+        .unwrap_or_default();
+    if relative {
+        // A relative path may target a directory module (`./b` →
+        // b/index.ts), whose module symbol is named by the directory — the
+        // path comparison below does the filtering.
+        for alt in ["index", "__init__", "mod"] {
+            if let Some(v) = name_index.get(alt) {
+                cand_vec.extend(v.iter());
+            }
+        }
+    }
+    let cands = &cand_vec[..];
+
     if relative {
         let target = relative_components(eff, caller.file).unwrap_or_default();
         let mut best: Option<(SymbolId, u32)> = None;
@@ -770,12 +803,13 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         if matches!(root_file, "lib.rs" | "main.rs") {
             return true;
         }
-        // A root-level module lives directly under the source root
-        // (`src/a.rs` or `a.rs`), never nested (`src/nested/a.rs`).
+        // A root-level module lives directly under the caller's crate root
+        // (`src/a.rs` for a src/-rooted crate), never nested elsewhere.
+        let prefix = crate_root_prefix(caller.file);
         let csegs = candidate_segments(c);
         return c.kind == SymbolKind::Module
-            && csegs.ends_with(&[name.to_string()])
-            && csegs.len() <= 2;
+            && csegs.len() == prefix.len() + 1
+            && csegs.last().is_some_and(|s| s == name);
     }
     let parent: Vec<&str> = parent.iter().map(|s| s.as_str()).collect();
     let csegs = candidate_segments(c);
@@ -798,13 +832,19 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand, caller: &Caller)
         // module candidate may match it — otherwise `use crate::a::B` could
         // bind a struct `B` in `src/a/B.rs`.
         let chain_match = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
-        // A crate-rooted path counts segments from the crate root, so at
-        // most one directory (the source root) may sit above the matched
-        // chain — for a symbol import the chain is the module path, for a
-        // module import it includes the final name.
+        // A crate-rooted path anchors at the CALLER's crate root (the last
+        // `src` directory — workspaces nest crates under crates/foo/src):
+        // the candidate's path must be exactly the root prefix plus the
+        // matched chain.
         if crate_rooted {
-            return (csegs.ends_with(&parent[..]) && csegs.len() <= parent.len() + 1)
-                || (chain_match && csegs.len() <= chain.len() + 1);
+            let prefix = crate_root_prefix(caller.file);
+            let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+            let anchored = |chain: &[&str]| {
+                csegs.starts_with(&pref)
+                    && csegs.ends_with(chain)
+                    && csegs.len() == pref.len() + chain.len()
+            };
+            return anchored(&parent[..]) || (chain_match && anchored(&chain));
         }
         if csegs.ends_with(&parent[..]) {
             return true;
@@ -1221,12 +1261,12 @@ mod tests {
     fn crate_qualified_imports_bind() {
         let g = graph(&[
             (
-                "examples/demo.rs",
+                "src/demo.rs",
                 "use crate::fresh::LiveGraph;\nfn main() { let _g: LiveGraph; }\n",
             ),
             ("src/fresh.rs", "pub struct LiveGraph;\n"),
         ]);
-        let from = module_of(&g, "examples/demo.rs");
+        let from = module_of(&g, "src/demo.rs");
         let e = g
             .out_edges(from)
             .find(|e| e.kind == EdgeKind::Imports)
@@ -1783,6 +1823,68 @@ mod tests {
             SymbolKind::Module,
             "the struct namesake must not capture the import"
         );
+    }
+
+    #[test]
+    fn nested_workspace_crate_paths_bind() {
+        // A workspace nests crates under crates/foo/src — `crate::a::B`
+        // from inside that crate resolves against ITS src root.
+        let g = graph(&[
+            (
+                "crates/foo/src/x.rs",
+                "use crate::a::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("crates/foo/src/a.rs", "pub struct B;\n"),
+            ("crates/bar/src/a.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "crates/foo/src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("binds the own-crate a.rs")).unwrap();
+        assert_eq!(target.file, "crates/foo/src/a.rs");
+    }
+
+    #[test]
+    fn relative_import_binds_directory_index_module() {
+        // `./b` may target b/index.ts, whose module is named by the
+        // directory.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b\";\nexport function a() { return b(); }\n",
+            ),
+            ("b/index.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("./b binds b/index.ts")).unwrap();
+        assert_eq!(target.file, "b/index.ts");
+    }
+
+    #[test]
+    fn multi_component_include_prefers_importer_relative_target() {
+        // `#include "sub/b.h"` from src/main.c: src/sub/b.h (the
+        // importer-relative path) beats a same-suffix header at the root.
+        let g = graph(&[
+            ("sub/b.h", "int root_b(void);\n"),
+            ("src/sub/b.h", "int src_b(void);\n"),
+            (
+                "src/main.c",
+                "#include \"sub/b.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "src/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "sub/b.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("src/sub/b.h wins")).unwrap();
+        assert_eq!(target.file, "src/sub/b.h");
     }
 
     #[test]
