@@ -480,6 +480,33 @@ fn resolve_import(
         if !is_code_extension(ext) {
             break 'shape1;
         }
+        if relative {
+            // A relative file-naming import resolves to exactly one path:
+            // apply the `..`/`.` components against the importing file's
+            // directory and require that file — never a same-basename file
+            // elsewhere. A missing target falls through to the NodeNext
+            // retry below.
+            if let Some(target) = relative_components(eff, caller.file) {
+                let joined = target.join("/");
+                if let Some(cands) = by_basename.get(seg) {
+                    for c in cands {
+                        if c.id == edge.from
+                            || lang_family(c.language) != lang_family(caller.language)
+                        {
+                            continue;
+                        }
+                        if c.file == joined {
+                            return Some((c.id, 0));
+                        }
+                    }
+                }
+            }
+            if matches!(ext, "js" | "mjs" | "cjs" | "jsx") {
+                eff = &eff[..eff.len() - ext.len() - 1];
+                break 'shape1; // retry as a relative module path
+            }
+            return None;
+        }
         if let Some(cands) = by_basename.get(seg) {
             let mut best: Option<(SymbolId, u32)> = None;
             let mut ties = 0u16;
@@ -517,14 +544,9 @@ fn resolve_import(
             }
             return best.map(|(id, _)| (id, ties));
         }
-        // No file of that basename: TS NodeNext writes `"./b.js"` while
-        // meaning `b.ts` — retry as a relative module path without the
-        // extension. Anything else names a file we simply do not have.
-        if relative && matches!(ext, "js" | "mjs" | "cjs" | "jsx") {
-            eff = &eff[..eff.len() - ext.len() - 1];
-        } else {
-            return None;
-        }
+        // A non-relative file-naming import that finds no file of that
+        // basename names a file we simply do not have.
+        return None;
     }
 
     // Shape 2: the import names a module (or, for qualified `::` paths, a
@@ -546,22 +568,7 @@ fn resolve_import(
     // directory — `../lib/b` from `c/d/x.ts` means `c/lib/b`, not whichever
     // module is named `b` nearest by name.
     if relative {
-        let mut target: Vec<String> = caller
-            .file
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty() && *s != ".")
-            .map(String::from)
-            .collect();
-        target.pop(); // the importing file itself
-        for t in eff.split(['/', '\\']).filter(|s| !s.is_empty()) {
-            match t {
-                ".." => {
-                    target.pop();
-                }
-                "." => {}
-                t => target.push(t.to_string()),
-            }
-        }
+        let target = relative_components(eff, caller.file).unwrap_or_default();
         let mut best: Option<(SymbolId, u32)> = None;
         let mut ties = 0u16;
         for c in cands {
@@ -588,12 +595,14 @@ fn resolve_import(
 
     let qualified = segments.len() > 1;
     if qualified
+        && caller.language == Language::Rust
         && matches!(
             segments.first(),
             Some(&"std") | Some(&"core") | Some(&"alloc")
         )
     {
-        return None; // Rust prelude roots are never in-repo
+        return None; // Rust prelude roots are never in-repo (Rust only:
+                     // `import core.utils` in Python may be a real local package)
     }
 
     let mut best: Option<(SymbolId, u32)> = None;
@@ -629,6 +638,29 @@ fn resolve_import(
         }
     }
     best.map(|(id, _)| (id, ties))
+}
+
+/// Resolve a relative import path against the importing file's directory,
+/// applying `..` and `.` components: `../lib/b` from `c/d/x.ts` →
+/// ["c", "lib", "b"]. `None` when the path escapes the repository root.
+fn relative_components(raw: &str, caller_file: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = caller_file
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(String::from)
+        .collect();
+    parts.pop(); // the importing file itself
+    for t in raw
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+    {
+        if t == ".." {
+            parts.pop()?; // escaping the repo root: not an in-repo path
+        } else {
+            parts.push(t.to_string());
+        }
+    }
+    Some(parts)
 }
 
 /// The candidate's path as segments, file stem for the final component
@@ -684,7 +716,13 @@ fn proven_for_candidate(raw: &str, segments: &[&str], c: &Cand) -> bool {
         return false;
     }
     if raw.contains("::") {
-        (1..=parent.len()).any(|i| csegs.ends_with(&parent[i - 1..]))
+        // The full parent chain must anchor at the candidate: a shorter
+        // suffix would let `crate::a::b::B` bind any `B` under a `b.rs`
+        // anywhere, or `serde::de::Deserialize` capture a namesake in a
+        // local `de.rs`. (Cost: an import qualified by the crate's own
+        // *name* — `codescope::fresh::LiveGraph` from inside `codescope` —
+        // stays unbound; use `crate::`-style paths.)
+        csegs.ends_with(&parent[..])
     } else {
         // Dotted package paths name the package the class lives in: the
         // parent chain must be a suffix of the candidate's directory, with
@@ -1300,6 +1338,112 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("../sub/b.h resolves")).unwrap();
         assert_eq!(target.file, "sub/b.h");
+    }
+
+    #[test]
+    fn relative_file_import_with_missing_target_stays_unbound() {
+        // `../lib/b.ts` with no c/lib/b.ts must not fall back to the
+        // same-basename file in the importer's own directory.
+        let g = graph(&[
+            (
+                "c/d/x.ts",
+                "import { b } from \"../lib/b.ts\";\nexport function x() { return b(); }\n",
+            ),
+            ("c/d/b.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "c/d/x.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "../lib/b.ts with no target must not bind c/d/b.ts"
+        );
+    }
+
+    #[test]
+    fn relative_file_import_beats_same_basename_decoy() {
+        let g = graph(&[
+            (
+                "c/d/x.ts",
+                "import { b } from \"../lib/b.ts\";\nexport function x() { return b(); }\n",
+            ),
+            ("c/d/b.ts", "export function b() { return 1; }\n"),
+            ("c/lib/b.ts", "export function b() { return 2; }\n"),
+        ]);
+        let from = module_of(&g, "c/d/x.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("exact path resolves")).unwrap();
+        assert_eq!(target.file, "c/lib/b.ts");
+    }
+
+    #[test]
+    fn deep_crate_path_requires_full_ancestry() {
+        // `crate::a::b::B` must not bind a B that merely sits in some `b.rs`;
+        // the a/b chain has to be real.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a::b::B;\nfn main() { let _b: B; }\n",
+            ),
+            ("src/b.rs", "pub struct B;\n"),
+            ("src/a/b.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("a/b.rs wins over plain b.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/a/b.rs");
+    }
+
+    #[test]
+    fn external_crate_path_with_namesake_in_matched_module_stays_unbound() {
+        // Even a namesake Deserialize living IN a de.rs must not capture
+        // `serde::de::Deserialize`: serde:: is an external root.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use serde::de::Deserialize;\nfn main() { let _d: Deserialize; }\n",
+            ),
+            ("src/de.rs", "pub struct Deserialize;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "serde::de::Deserialize must not capture the in-repo de::Deserialize"
+        );
+    }
+
+    #[test]
+    fn std_root_guard_is_rust_only() {
+        // `core` is a Rust prelude root, but in Python `import core.utils`
+        // may name a real local package.
+        let g = graph(&[
+            ("core/utils.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "import core.utils\n\ndef go():\n    return core.utils.helper()\n",
+            ),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("core.utils binds in Python")).unwrap();
+        assert_eq!(target.file, "core/utils.py");
     }
 
     #[test]
