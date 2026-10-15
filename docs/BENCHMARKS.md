@@ -78,17 +78,37 @@ keeps this swappable without touching the query or extraction layers.
 
 ## Methodology
 
-- **Dense corpus** (`gen_repo.py`): N files × M functions, every function 4
-  lines with one call — maximizes symbol/edge density per byte (a storage worst
-  case).
-- **Realistic corpus** (`gen_realistic.py`): functions with doc comments, input
-  validation, loops and ~9 call sites each (~18 LOC/symbol) — closer to real
-  Rust.
+- **Dense corpus** (`scripts/gen_repo.py`): N files × M functions, every
+  function 4 lines with one call — maximizes symbol/edge density per byte (a
+  storage worst case).
+- **Realistic corpus** (`scripts/gen_realistic.py`): functions with doc
+  comments, input validation, loops and ~9 call sites each (21 lines per
+  function, ~21 LOC/symbol) — closer to real Rust.
 - **Query/throughput**: `cargo bench` (criterion) — `benches/index_bench.rs`,
   `benches/query_bench.rs`.
-- **Correctness**: 24 unit/integration tests (`cargo test`), plus dogfooding —
+- **Correctness**: unit/integration tests (`cargo test`), plus dogfooding —
   `codescope` indexes its own source and answers callers/callees/blast-radius
   correctly.
+
+## A second data point: 2-core Codespace (2026-10-14)
+
+The headline numbers above are 4-core-scoped; hardware matters. Reproduced on
+a 2-core / 8 GB shared-vCPU Codespace (release build, rustc 1.99):
+
+| Workload | 4-core (above) | 2-core Codespace |
+|---|---|---|
+| Cold index, dense 125k LOC (501 files, 26k symbols, 50k edges) | ~0.2 s @ 100k | 0.86 s |
+| Cold index, realistic ~1.15M LOC (1,401 files, 57k symbols, **1.2M edges**) | ~1.6 s @ 909k LOC / 480k edges | 16.7 s |
+| 1-file incremental patch (1,402-file index) | 55–58 ms | 113 ms |
+| `repo_summary` in-process (criterion) | 1.69 ms | 6.8 ms |
+| `structural_search` in-process (criterion) | 1.39 ms | 1.20 ms |
+| Index size, realistic ~1M corpus | ~75% of source | 67% (34.2 MB / 51.1 MB) |
+
+The 1M-row corpus here is denser than the 4-core run's (1.2M vs 480k edges),
+so it stresses resolution harder; PRD targets (<10 s @ 100k, <2 min @ 1M)
+still clear with 7–12× margin. CLI query walls additionally pay a graph load
+per invocation (~1.6 s on the 1M index there) — the MCP server caches the
+graph and pays only the in-process cost.
 
 ## Freshness & reload (ADR-0020)
 
@@ -106,7 +126,7 @@ Release build, 4-core container, `cargo run --release --example fresh_latency --
 ## `find` relevance (ADR-0021)
 
 `cargo test --test find_relevance -- --nocapture` — 16 behavior-phrased queries over codescope's own source:
-**MRR 0.693 · R@1 0.56 · R@5 0.88** (baseline BM25F+RRF before file-docs/test-downweight: 0.644 / 0.56 / 0.75).
+**MRR 0.702 · R@1 0.56 · R@5 0.88** (after ADR-0023 import-edge resolution incl. bare-import locality anchoring; 0.693 / 0.56 / 0.88 before the PR; baseline BM25F+RRF before file-docs/test-downweight: 0.644 / 0.56 / 0.75).
 CLI `find` end-to-end: 115 ms (gson, 4.5k symbols), 690 ms (dotnet/samples, 25k symbols).
 
 ## Call-resolution accuracy (ADR-0022)

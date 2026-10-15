@@ -16,6 +16,7 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// What the resolver needs to know about a candidate target.
+#[derive(Clone)]
 struct Cand {
     id: SymbolId,
     kind: SymbolKind,
@@ -25,6 +26,7 @@ struct Cand {
     stem: String,
     dir: String,
     owner: Option<String>,
+    language: Language,
 }
 
 /// What the resolver needs to know about the edge's source.
@@ -118,19 +120,32 @@ pub fn resolve(graph: &mut CodeGraph) {
 fn resolve_in(graph: &mut CodeGraph, scope: Option<&Scope>) {
     // Snapshot the lookups we need (immutable borrow) before mutating edges.
     let mut name_index: HashMap<&str, Vec<Cand>> = HashMap::new();
+    // Module symbols keyed by their file's basename — for imports that name a
+    // file outright (`#include "list.h"`, `from "./b.ts"`).
+    let mut by_basename: HashMap<&str, Vec<Cand>> = HashMap::new();
     for s in graph.symbols() {
         let (stem, dir) = stem_and_dir(&s.file);
-        name_index.entry(s.name.as_str()).or_default().push(Cand {
+        let cand = Cand {
             id: s.id,
             kind: s.kind,
             file: s.file.clone(),
             stem,
             dir,
             owner: s.owner.clone(),
-        });
+            language: s.language,
+        };
+        if s.kind == SymbolKind::Module {
+            if let Some(base) = s.file.rsplit(['/', '\\']).next() {
+                by_basename.entry(base).or_default().push(cand.clone());
+            }
+        }
+        name_index.entry(s.name.as_str()).or_default().push(cand);
     }
     // Deterministic candidate order → deterministic tie-breaking.
     for v in name_index.values_mut() {
+        v.sort_by_key(|c| c.id);
+    }
+    for v in by_basename.values_mut() {
         v.sort_by_key(|c| c.id);
     }
 
@@ -167,11 +182,17 @@ fn resolve_in(graph: &mut CodeGraph, scope: Option<&Scope>) {
                 language: src.language,
             };
             let file_imports = imports.get(src.file.as_str()).unwrap_or(&no_imports);
-            resolve_one(edge, &caller, file_imports, &name_index).map(|(to, alts)| (i, to, alts))
+            let bound = if edge.kind == EdgeKind::Imports {
+                resolve_import(edge, &caller, &name_index, &by_basename)
+            } else {
+                resolve_one(edge, &caller, file_imports, &name_index)
+            };
+            bound.map(|(to, alts)| (i, to, alts))
         })
         .collect();
     drop(name_index);
     drop(imports);
+    drop(by_basename);
 
     let edges = graph.edges_mut();
     for (i, to, alternatives) in bindings {
@@ -350,6 +371,723 @@ fn resolve_one(
 /// (Receivers with an inferred type carry that type as the qualifier and
 /// bind via the owner rule instead.)
 const MIN_RECEIVER_SCORE: u32 = 9;
+
+/// File extensions an import string may carry when it names a file outright
+/// (`#include "list.h"`, `require "./b.ts"`). Anything else with a dot is a
+/// dotted module path (`app.store.Repo`), not a filename.
+fn is_code_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "h" | "hh"
+            | "hpp"
+            | "hxx"
+            | "inc"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "cs"
+            | "rs"
+            | "py"
+            | "pyi"
+            | "rb"
+            | "go"
+            | "java"
+            | "ts"
+            | "tsx"
+            | "mts"
+            | "cts"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+    )
+}
+
+/// Languages that can import each other's files. Imports are language-local
+/// (`import b` in Python can never mean `cpp/b.hpp`); the one real-world
+/// crossover is TypeScript pulling in JavaScript (and C including C++ headers).
+fn lang_family(lang: Language) -> u8 {
+    match lang {
+        Language::JavaScript | Language::TypeScript => 1,
+        Language::C | Language::Cpp => 2,
+        Language::Rust => 3,
+        Language::Python => 4,
+        Language::Go => 5,
+        Language::Java => 6,
+        Language::CSharp => 7,
+        Language::Ruby => 8,
+    }
+}
+
+/// The caller's crate-root prefix: path components up to and including the
+/// last `src` directory (`crates/foo/src` for `crates/foo/src/x.rs`; empty
+/// for a crate rooted at the repository root).
+fn crate_root_prefix(caller_file: &str) -> Vec<String> {
+    let parts: Vec<&str> = caller_file
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    match parts.iter().rposition(|s| *s == "src") {
+        Some(i) if i + 1 < parts.len() => parts[..=i].iter().map(|s| s.to_string()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The full parent path of a file (`py/sub` for `py/sub/a.py`, "" at the
+/// root) — directory affinity must compare whole paths, not just the final
+/// segment, or `app/include/` and `vendor/include/` look alike.
+fn parent_path(path: &str) -> &str {
+    path.rsplit_once(['/', '\\']).map(|(d, _)| d).unwrap_or("")
+}
+
+/// Bind an `Imports` edge to the module symbol of the file it names.
+///
+/// Every shape is conservative (ADR-0023): candidates are always confined to
+/// the caller's language family and never include the importing file itself.
+///
+/// * **File-naming imports** — the string carries a code extension
+///   (`"list.h"`, `"./b.ts"`). Bind the module symbol of the file with that
+///   exact basename; same-directory files win ties. `#include <stdio.h>`
+///   stays unbound unless a `stdio.h` actually exists in the repo. TS
+///   NodeNext-style `"./b.js"` (which means `b.ts`) retries without the JS
+///   extension as a relative module path.
+/// * **Relative module imports** — `"./b"`, `"../lib/b"`. Resolved as an
+///   exact path against the importing file's directory (`..` components
+///   applied), matching the module whose file lives there — never a
+///   same-named module elsewhere.
+/// * **Qualified imports** — `app.store.Repo`, `crate::fresh::LiveGraph`.
+///   The parent path must be proven *per candidate*: the candidate's own
+///   path must end with the parent chain (dotted/slash) or with a suffix of
+///   it (`::`-paths, where the crate-name prefix need not match the disk
+///   layout), so `crate::a::B` cannot bind a `B` that lives outside `a`.
+///   Rust's prelude roots (`std`, `core`, `alloc`) are never in-repo.
+/// * **Bare imports** — `b`, `import time`, `use serde;`. Single-segment
+///   names bind module symbols only, never a same-named function.
+fn resolve_import(
+    edge: &Edge,
+    caller: &Caller,
+    name_index: &HashMap<&str, Vec<Cand>>,
+    by_basename: &HashMap<&str, Vec<Cand>>,
+) -> Option<(SymbolId, u16)> {
+    let raw = edge
+        .to_name
+        .trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
+    let relative = raw.starts_with("./") || raw.starts_with("../");
+    let mut eff = raw;
+
+    // Shape 1: the import names a file (`list.h`). Only a module in a file
+    // with that exact basename can match, which keeps system includes
+    // unbound.
+    'shape1: {
+        let seg = eff.rsplit(['/', '\\']).next().unwrap_or(eff);
+        let Some((_, ext)) = seg.rsplit_once('.') else {
+            break 'shape1;
+        };
+        if !is_code_extension(ext) {
+            break 'shape1;
+        }
+        if relative {
+            // A relative file-naming import resolves to exactly one path:
+            // apply the `..`/`.` components against the importing file's
+            // directory and require that file — never a same-basename file
+            // elsewhere. A missing target falls through to the NodeNext
+            // retry below.
+            if let Some(target) = relative_components(eff, caller.file) {
+                let joined = target.join("/");
+                if let Some(cands) = by_basename.get(seg) {
+                    for c in cands {
+                        if c.id == edge.from
+                            || lang_family(c.language) != lang_family(caller.language)
+                        {
+                            continue;
+                        }
+                        if c.file == joined {
+                            return Some((c.id, 0));
+                        }
+                    }
+                }
+            }
+            if matches!(ext, "js" | "mjs" | "cjs" | "jsx") {
+                eff = &eff[..eff.len() - ext.len() - 1];
+                break 'shape1; // retry as a relative module path
+            }
+            return None;
+        }
+        // A non-relative file-naming import from JS/TS (`import "chart.js"`)
+        // still means node_modules — extension or not, only `./`-relative
+        // imports reach in-repo files (handled by the exact branch above).
+        if matches!(caller.language, Language::JavaScript | Language::TypeScript) {
+            return None;
+        }
+        if let Some(cands) = by_basename.get(seg) {
+            let mut best: Option<(SymbolId, u32)> = None;
+            let mut ties = 0u16;
+            for c in cands {
+                if c.id == edge.from {
+                    continue; // a file never includes itself
+                }
+                if lang_family(c.language) != lang_family(caller.language) {
+                    continue;
+                }
+                // A multi-component include (`sub/b.h`, `../sub/b.h`) must
+                // honor its path: a file at that exact suffix beats a
+                // same-basename file in the importer's directory. `c.dir` is
+                // the full parent path — see `parent_path`.
+                // Normalize away `.`/`..` components so `../sub/b.h` competes
+                // on its real path.
+                // The import's own suffix with `..` APPLIED (`sub/../b.h` →
+                // `b.h`, not `sub/b.h`): internal parent traversal pops, it
+                // does not vanish.
+                let mut suffix_parts: Vec<&str> = Vec::new();
+                for t in eff.split(['/', '\\']).filter(|s| !s.is_empty()) {
+                    if t == ".." {
+                        suffix_parts.pop();
+                    } else if t != "." {
+                        suffix_parts.push(t);
+                    }
+                }
+                let full = suffix_parts.join("/");
+                let on_path = !full.is_empty()
+                    && (c.file == full
+                        || (full.contains('/') && c.file.ends_with(&format!("/{full}"))));
+                // The importer-relative target — components resolved
+                // against the includer's directory with `..` applied
+                // (`sub/../b.h` from src/main.c means src/b.h) — outranks
+                // the same suffix at the repo root: C searches the
+                // includer's directory first.
+                let local_hit =
+                    relative_components(eff, caller.file).is_some_and(|t| c.file == t.join("/"));
+                if full.contains('/') && !on_path {
+                    continue; // `sub/b.h` never means an unrelated same-basename file
+                }
+                let score = 1
+                    + u32::from(local_hit) * 48
+                    + u32::from(parent_path(&c.file) == parent_path(caller.file)) * 32
+                    + u32::from(on_path) * 16;
+                match best {
+                    Some((_, b)) if b > score => {}
+                    Some((_, b)) if b == score => ties += 1,
+                    _ => {
+                        best = Some((c.id, score));
+                        ties = 0;
+                    }
+                }
+            }
+            return best.map(|(id, _)| (id, ties));
+        }
+        // A non-relative file-naming import that finds no file of that
+        // basename names a file we simply do not have.
+        return None;
+    }
+
+    // Shape 2: the import names a module (or, for qualified `::` paths, a
+    // symbol inside one). Normalize `crate::a::B`, `app.store.Repo`, `./b`
+    // down to the candidate name.
+    let seg = eff.rsplit(['/', '\\']).next().unwrap_or(eff);
+    // Relative paths keep their full final component for the exact path
+    // comparison below; the *lookup* name is its first dot segment, because
+    // module symbols are named by the file stem before the first dot
+    // (`b.test.ts` → `b`).
+    let name = if relative {
+        seg.split('.').next().unwrap_or(seg)
+    } else {
+        seg.rsplit("::")
+            .next()
+            .and_then(|s| s.rsplit('.').next())
+            .unwrap_or(seg)
+    };
+    let segments: Vec<&str> = eff
+        .split([':', '.', '/', '\\', ' '])
+        .filter(|s| !s.is_empty())
+        .collect();
+    // Relative imports resolve as exact paths against the importer's
+    // directory — `../lib/b` from `c/d/x.ts` means `c/lib/b`, not whichever
+    // module is named `b` nearest by name.
+    let mut cand_vec: Vec<&Cand> = name_index
+        .get(name)
+        .map(|v| v.iter().collect())
+        .unwrap_or_default();
+    {
+        // Any import may target a directory module whose symbol keeps the
+        // entry-file's name (`./b` → b/index.ts, `import pkg` →
+        // pkg/__init__.py, `use crate::a;` → src/a/mod.rs) — always
+        // collect those candidates; the path evidence does the filtering.
+        for alt in ["index", "__init__", "mod"] {
+            if let Some(v) = name_index.get(alt) {
+                // Only the entry files' MODULE symbols: a `fn index`
+                // sharing the name is not a directory-module candidate.
+                cand_vec.extend(v.iter().filter(|c| c.kind == SymbolKind::Module));
+            }
+        }
+    }
+    // An import literally named `index`/`__init__`/`mod` reaches those
+    // buckets twice (primary + alt): dedupe so a unique resolution is not
+    // reported as a tie.
+    cand_vec.sort_by_key(|c| c.id);
+    cand_vec.dedup_by_key(|c| c.id);
+    let cands = &cand_vec[..];
+
+    if relative {
+        let target = relative_components(eff, caller.file).unwrap_or_default();
+        let mut best: Option<(SymbolId, u32)> = None;
+        let mut ties = 0u16;
+        for c in cands {
+            if c.id == edge.from || lang_family(c.language) != lang_family(caller.language) {
+                continue;
+            }
+            if c.kind != SymbolKind::Module {
+                continue; // a relative path names a file/module, not a symbol
+            }
+            // Accept the module identity OR the explicit entry-file path
+            // (`./b/index` names b/index.ts, whose module identity
+            // collapses to `b`).
+            let remapped = candidate_segments(c);
+            let mut raw: Vec<String> = c
+                .file
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            raw.pop();
+            if let Some(fname) = c.file.rsplit(['/', '\\']).next() {
+                let stem = match fname.rsplit_once('.') {
+                    Some((s, e)) if is_code_extension(e) => s.to_string(),
+                    _ => fname.split('.').next().unwrap_or(fname).to_string(),
+                };
+                raw.push(stem);
+            }
+            if remapped != target && raw != target {
+                continue;
+            }
+            // `./b` prefers the FILE b.ts over the directory module
+            // b/index.ts when both normalize to the same path.
+            let fstem = c
+                .file
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&c.file)
+                .split('.')
+                .next()
+                .unwrap_or("");
+            let score = 1 + u32::from(Some(fstem) == target.last().map(|s| s.as_str())) * 2;
+            match best {
+                Some((_, b)) if b > score => {}
+                Some((_, b)) if b == score => ties += 1,
+                _ => {
+                    best = Some((c.id, score));
+                    ties = 0;
+                }
+            }
+        }
+        return best.map(|(id, _)| (id, ties));
+    }
+
+    let qualified = segments.len() > 1;
+    // Whether BOTH crate-root files exist under the caller's crate prefix:
+    // a module file's crate ownership (library vs binary) is then unknowable
+    // without `mod` declarations, and root-file bindings must abstain.
+    let (has_lib, has_main) = if qualified && caller.language == Language::Rust {
+        let pref = crate_root_prefix(caller.file).join("/");
+        let has_root = |n: &str| {
+            let want = if pref.is_empty() {
+                n.to_string()
+            } else {
+                format!("{pref}/{n}")
+            };
+            by_basename
+                .get(n)
+                .is_some_and(|v| v.iter().any(|c| c.file == want))
+        };
+        (has_root("lib.rs"), has_root("main.rs"))
+    } else {
+        (false, false)
+    };
+    if qualified
+        && caller.language == Language::Rust
+        && matches!(
+            segments.first(),
+            Some(&"std") | Some(&"core") | Some(&"alloc")
+        )
+    {
+        return None; // Rust prelude roots are never in-repo (Rust only:
+                     // `import core.utils` in Python may be a real local package)
+    }
+
+    let caller_dir: Vec<String> = {
+        let mut parts: Vec<String> = caller
+            .file
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(String::from)
+            .collect();
+        parts.pop();
+        parts
+    };
+    let mut best: Option<(SymbolId, u32)> = None;
+    let mut ties = 0u16;
+    for c in cands {
+        if c.id == edge.from || lang_family(c.language) != lang_family(caller.language) {
+            continue;
+        }
+        if qualified {
+            if !proven_for_candidate(eff, &segments, c, caller, has_lib, has_main) {
+                continue;
+            }
+            // Python's `import a.b.c` imports a MODULE (a `from`-import of a
+            // symbol is a different statement the extractor captures
+            // separately): dotted python chains bind module candidates only.
+            if caller.language == Language::Python
+                && !eff.contains("::")
+                && c.kind != SymbolKind::Module
+            {
+                continue;
+            }
+        } else {
+            // A bare import names a module — never a function. Only Python
+            // and Ruby resolve bare names against the importer's own tree
+            // (script-dir/`$LOAD_PATH` semantics): for them the identity
+            // must anchor at the repository root or the importer's
+            // directory. For every other language a bare name means
+            // something outside the tree — node_modules for JS/TS, the
+            // standard library for Go, the extern prelude for Rust — and
+            // binding a same-named sibling would invent an edge.
+            if !matches!(caller.language, Language::Python | Language::Ruby) {
+                continue;
+            }
+            if c.kind != SymbolKind::Module {
+                continue;
+            }
+            let identity = candidate_segments(c);
+            let anchored_at_root = identity.len() == 1 && identity[0] == name;
+            let anchored_at_caller_dir = identity.len() == caller_dir.len() + 1
+                && identity[..identity.len() - 1] == caller_dir[..]
+                && identity.last().is_some_and(|s| s == name);
+            if !anchored_at_root && !anchored_at_caller_dir {
+                continue;
+            }
+        }
+        let mut score = 1;
+        if c.kind == SymbolKind::Module {
+            score += 6; // an import names a module first, a symbol second
+        }
+        if parent_path(&c.file) == parent_path(caller.file) {
+            score += 4; // relative imports resolve against the importer's dir
+        }
+        if c.file == caller.file {
+            score += 2;
+        }
+        match best {
+            Some((_, b)) if b > score => {}
+            Some((_, b)) if b == score => ties += 1,
+            _ => {
+                best = Some((c.id, score));
+                ties = 0;
+            }
+        }
+    }
+    best.map(|(id, _)| (id, ties))
+}
+
+/// Resolve a relative import path against the importing file's directory,
+/// applying `..` and `.` components: `../lib/b` from `c/d/x.ts` →
+/// ["c", "lib", "b"]. `None` when the path escapes the repository root.
+fn relative_components(raw: &str, caller_file: &str) -> Option<Vec<String>> {
+    let mut parts: Vec<String> = caller_file
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+        .map(String::from)
+        .collect();
+    parts.pop(); // the importing file itself
+    for t in raw
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+    {
+        if t == ".." {
+            parts.pop()?; // escaping the repo root: not an in-repo path
+        } else {
+            parts.push(t.to_string());
+        }
+    }
+    Some(parts)
+}
+
+/// The candidate's path as segments, file stem for the final component
+/// (`src/fresh.rs` → ["src", "fresh"]).
+fn candidate_segments(c: &Cand) -> Vec<String> {
+    module_segments(&c.file, Some(c.language))
+}
+
+/// A file's module identity as path segments: directory components plus the
+/// file stem, with `mod.rs` / `__init__.py` / `index.ts` named by their
+/// directory. (`lib.rs` is deliberately NOT remapped: a python `pkg/lib.py`
+/// is a real module named `lib`, not the directory's package root.)
+/// A file's module identity as path segments, with language awareness: a Rust
+/// (`src/lib.rs`, `src/main.rs`) IS the crate root directory's module, not a
+/// module named `lib`/`main` beside it. (Python `pkg/lib.py` stays a real
+/// module named `lib`.)
+fn module_segments(path: &str, lang: Option<Language>) -> Vec<String> {
+    let fname = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    // Strip only the final extension: `b.test.ts` stems to `b.test`.
+    let stem = match fname.rsplit_once('.') {
+        Some((s, e)) if is_code_extension(e) => s,
+        _ => fname.split('.').next().unwrap_or(fname),
+    };
+    let mut segs: Vec<String> = path
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    segs.pop(); // the filename itself
+    if !segs.is_empty() {
+        if matches!(stem, "mod" | "__init__" | "index") {
+            return segs;
+        }
+        if lang == Some(Language::Rust) && matches!(stem, "lib" | "main") {
+            return segs; // crate-root files ARE the root directory's module
+        }
+    }
+    segs.push(stem.to_string());
+    segs
+}
+
+/// Per-candidate in-repo evidence for a qualified import path: the parent
+/// chain must anchor at the candidate's own path.
+///
+/// * `::`-separated (Rust-style): the full parent chain (after any
+///   `crate::` root) must be a path suffix of the candidate — or, for a
+///   *module* import (`use crate::a::b`), the chain including the final
+///   name. `self::`/`super::` are caller-relative and anchor to the
+///   importing file's own module ancestry, so `self::B` cannot bind a `B`
+///   from an unrelated module.
+/// * dotted/slash package paths: the full parent chain must be a path
+///   suffix of the candidate's directory — `app.store.Repo` passes for
+///   `app/store/Repo.java`, while `java.util.List` fails even beside a
+///   `java/` directory (there is no `java/util` chain above the candidate).
+fn proven_for_candidate(
+    raw: &str,
+    segments: &[&str],
+    c: &Cand,
+    caller: &Caller,
+    has_lib: bool,
+    has_main: bool,
+) -> bool {
+    let name = segments[segments.len() - 1];
+    let mut parent: Vec<String> = segments[..segments.len() - 1]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // `crate::` is root-relative; `self::`/`super::` are caller-relative —
+    // dropping them without anchoring would let `self::B` bind any
+    // same-named symbol in the language.
+    let mut supers = 0usize;
+    let mut caller_relative = false;
+    let mut crate_rooted = false;
+    while matches!(
+        parent.first().map(|s| s.as_str()),
+        Some("crate") | Some("self") | Some("super")
+    ) {
+        match parent.remove(0).as_str() {
+            "super" => {
+                supers += 1;
+                caller_relative = true;
+            }
+            "self" => caller_relative = true,
+            "crate" => crate_rooted = true,
+            _ => {}
+        }
+    }
+    let bare = caller_relative && parent.is_empty();
+    // Rust 2018+: an in-crate path is `crate::`/`self::`/`super::`-prefixed
+    // (or crate-name-qualified, which ADR-0023 abstains on). A bare
+    // two-segment `::` path from Rust is therefore an external crate
+    // reference (`config::Config`) and never binds — not even to a module
+    // that happens to share the crate's name.
+    if caller.language == Language::Rust && raw.contains("::") && !crate_rooted && !caller_relative
+    {
+        return false;
+    }
+    if caller_relative {
+        let mut caller_segs = module_segments(caller.file, Some(caller.language));
+        if supers > 0 {
+            if caller_segs.len() < supers {
+                return false; // `super::` past the repository root
+            }
+            caller_segs.truncate(caller_segs.len() - supers);
+        }
+        // `self::` at a root module and `super::` that climbed to the root
+        // both leave the root itself as scope; an empty scope binds nothing.
+        if caller_segs.is_empty() {
+            return false;
+        }
+        // A bare `self::X`/`super::X` from a Rust crate-root file sees only
+        // that file's own items — the sibling crate root (lib.rs vs main.rs)
+        // is a different crate. PATHED imports (`self::child::X`) are
+        // unaffected: they anchor at the root directory.
+        if bare && caller.language == Language::Rust {
+            let caller_base = caller.file.rsplit(['/', '\\']).next().unwrap_or("");
+            if matches!(caller_base, "lib.rs" | "main.rs") {
+                // Own items, or a direct child module (`use self::child;`).
+                let prefix = crate_root_prefix(caller.file);
+                let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+                let csegs = candidate_segments(c);
+                return c.file == caller.file
+                    || (c.kind == SymbolKind::Module
+                        && csegs.starts_with(&prefix[..])
+                        && csegs.len() == pref.len() + 1);
+            }
+        }
+        // Keep any remaining path (`super::child::B` from `src/a/x.rs` is
+        // `src/a/child`, not merely `src/a`).
+        let mut scope = caller_segs;
+        scope.append(&mut parent);
+        parent = scope;
+    }
+
+    if parent.is_empty() {
+        // An empty scope is the CALLER's crate root. A *symbol* import
+        // (`crate::B`) binds only a symbol in the caller's own crate-root
+        // file (src/lib.rs, src/main.rs) — not a namesake in an unrelated
+        // module or another workspace crate. A *module* import
+        // (`use crate::a;`) binds the module directly under that root.
+        let prefix = crate_root_prefix(caller.file);
+        let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+        let csegs = candidate_segments(c);
+        if !csegs.starts_with(&prefix[..]) {
+            return false; // another crate's tree (workspace sibling)
+        }
+        // The binary (main.rs) and library (lib.rs) are separate crates:
+        // a `crate::` import binds only the caller's OWN root file — exactly
+        // at the crate prefix (a nested `src/nested/lib.rs` is that nested
+        // module's root, not the caller's). A module file abstains when both
+        // roots exist (its crate ownership is unknowable), and binds the one
+        // available root otherwise.
+        let caller_base = caller.file.rsplit(['/', '\\']).next().unwrap_or("");
+        let (want_root, ambiguous_owner) = match caller_base {
+            "lib.rs" => (Some("lib.rs"), false),
+            "main.rs" => (Some("main.rs"), false),
+            _ if has_lib && has_main => (None, true),
+            _ => (
+                if has_lib {
+                    Some("lib.rs")
+                } else {
+                    Some("main.rs")
+                },
+                false,
+            ),
+        };
+        let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or(&c.file);
+        if !ambiguous_owner
+            && want_root.is_some_and(|w| root_file == w)
+            && csegs.starts_with(&prefix[..])
+            && csegs.len() == prefix.len()
+        {
+            return true;
+        }
+        return c.kind == SymbolKind::Module
+            && csegs.len() == pref.len() + 1
+            && csegs.last().is_some_and(|s| s == name);
+    }
+    let parent: Vec<&str> = parent.iter().map(|s| s.as_str()).collect();
+    let csegs = candidate_segments(c);
+    let csegs: Vec<&str> = csegs.iter().map(|s| s.as_str()).collect();
+    if csegs.len() < parent.len() {
+        return false;
+    }
+    // `super::` that climbed to the crate root from a module file is the
+    // same ambiguity as `crate::B`: with both roots present, a root-file
+    // item could belong to either crate — abstain.
+    if caller_relative
+        && supers > 0
+        && has_lib
+        && has_main
+        && !matches!(
+            caller.file.rsplit(['/', '\\']).next().unwrap_or(""),
+            "lib.rs" | "main.rs"
+        )
+    {
+        let prefix = crate_root_prefix(caller.file);
+        let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+        let root_file = c.file.rsplit(['/', '\\']).next().unwrap_or("");
+        if matches!(root_file, "lib.rs" | "main.rs") && parent[..] == pref[..] && csegs == pref[..]
+        {
+            return false;
+        }
+    }
+    if raw.contains("::") {
+        // The full parent chain must anchor at the candidate: a shorter
+        // suffix would let `crate::a::b::B` bind any `B` under a `b.rs`
+        // anywhere, or `serde::de::Deserialize` capture a namesake in a
+        // local `de.rs`. A *module* candidate must BE the named module path
+        // (`parent + name`, as in `use crate::a::b`) — a module merely
+        // living at the parent scope is the CONTAINER of the named item,
+        // not the item, and must neither capture the import for a
+        // nonexistent symbol nor win the module preference over the real
+        // one. (Cost: an import qualified by the crate's own *name* —
+        // `codescope::fresh::LiveGraph` from inside `codescope` — stays
+        // unbound; use `crate::`-style paths.)
+        let mut chain: Vec<&str> = parent.clone();
+        chain.push(name);
+        let module_target = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
+        let in_scope = csegs.ends_with(&parent[..]);
+        if c.kind == SymbolKind::Module {
+            if !module_target {
+                return false;
+            }
+            if caller_relative {
+                return csegs == chain[..];
+            }
+            if crate_rooted {
+                let prefix = crate_root_prefix(caller.file);
+                let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+                return csegs.starts_with(&pref[..]) && csegs.len() == pref.len() + chain.len();
+            }
+            return true;
+        }
+        // A symbol target lives in the module at the parent scope.
+        if !in_scope {
+            return false;
+        }
+        if caller_relative {
+            return csegs == parent[..];
+        }
+        if crate_rooted {
+            let prefix = crate_root_prefix(caller.file);
+            let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+            return csegs.starts_with(&pref[..]) && csegs.len() == pref.len() + parent.len();
+        }
+        true
+    } else {
+        // Dotted package paths name the package the class lives in: either
+        // the parent chain is the candidate's entire module path (a symbol
+        // inside it, `pkg.lib.run` → pkg/lib.py), or it is a suffix of the
+        // candidate's directory with the file itself beyond it
+        // (`app.store.Repo` → app/store/Repo.java).
+        let stem = c
+            .file
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(&c.file)
+            .split('.')
+            .next()
+            .unwrap_or("");
+        let mut chain: Vec<&str> = parent.to_vec();
+        chain.push(name);
+        // A directory package (`import pkg.sub` → pkg/sub/__init__.py, whose
+        // module identity is [pkg, sub]) matches the full imported chain.
+        let package_match = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
+        // The whole-path rule (a symbol inside the module at `parent`) is a
+        // type-system thing (Java/C#) — for Python it would bind a missing
+        // submodule to its parent package.
+        let symbol_in_module = caller.language != Language::Python && csegs.ends_with(&parent[..]);
+        symbol_in_module
+            || package_match
+            || (csegs.len() > parent.len()
+                && csegs[..csegs.len() - 1].ends_with(&parent[..])
+                && stem == name)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -602,5 +1340,1518 @@ mod tests {
         );
         let start = g.symbols().find(|s| s.name == "Start").unwrap();
         assert_eq!(start.owner.as_deref(), Some("Server"));
+    }
+
+    /// The module symbol representing a file (import edges hang off it).
+    fn module_of(g: &CodeGraph, file: &str) -> crate::domain::SymbolId {
+        g.symbols()
+            .find(|s| s.kind == SymbolKind::Module && s.file == file)
+            .unwrap_or_else(|| panic!("no module symbol for {file}"))
+            .id
+    }
+
+    #[test]
+    fn c_includes_resolve_to_file_modules() {
+        let g = graph(&[
+            (
+                "a.c",
+                "#include <stdio.h>\n#include \"b.h\"\nint main(void) { return 0; }\n",
+            ),
+            ("b.h", "#include \"a.h\"\nint beta_c(int x);\n"),
+            ("a.h", "int alpha_c(int x);\n"),
+        ]);
+        let from = module_of(&g, "a.c");
+        let local = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "b.h")
+            .unwrap();
+        let target = g.symbol(local.to.expect("\"b.h\" resolves")).unwrap();
+        assert_eq!(target.file, "b.h");
+        let system = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "stdio.h")
+            .unwrap();
+        assert!(system.to.is_none(), "system include stays unbound");
+    }
+
+    #[test]
+    fn ts_relative_imports_resolve_to_file_modules() {
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { betaTs } from \"./b\";\nexport function alphaTs(x: number): number { return betaTs(x); }\n",
+            ),
+            (
+                "b.ts",
+                "import { alphaTs } from \"./a\";\nexport function betaTs(x: number): number { return x * 2; }\n",
+            ),
+        ]);
+        for (f, imp, target_file) in [("a.ts", "./b", "b.ts"), ("b.ts", "./a", "a.ts")] {
+            let from = module_of(&g, f);
+            let e = g
+                .out_edges(from)
+                .find(|e| e.kind == EdgeKind::Imports && e.to_name == imp)
+                .unwrap_or_else(|| panic!("no import edge {imp} in {f}"));
+            let target = g
+                .symbol(e.to.unwrap_or_else(|| panic!("{imp} should resolve")))
+                .unwrap();
+            assert_eq!(target.kind, SymbolKind::Module);
+            assert_eq!(target.file, target_file);
+        }
+    }
+
+    #[test]
+    fn imports_never_cross_language_families() {
+        // `import b` in Python must bind py/b.py, never a same-named module
+        // of another language — even when the decoy sits in the importer's
+        // own directory (without the family guard the decoy would win on
+        // the same-directory bonus).
+        let g = graph(&[
+            (
+                "py/a.py",
+                "import b\n\ndef alpha(x):\n    return b.beta(x)\n",
+            ),
+            ("py/b.py", "def beta(x):\n    return x\n"),
+            ("py/b.hpp", "int beta_cpp(int x);\n"),
+        ]);
+        let from = module_of(&g, "py/a.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "b")
+            .unwrap();
+        let target = g.symbol(e.to.expect("py import resolves")).unwrap();
+        assert_eq!(target.file, "py/b.py");
+    }
+
+    #[test]
+    fn header_cycles_are_detected() {
+        use crate::query::dependency_graph;
+        let g = graph(&[
+            ("a.h", "#include \"b.h\"\nint alpha_c(int x);\n"),
+            ("b.h", "#include \"a.h\"\nint beta_c(int x);\n"),
+        ]);
+        let dg = dependency_graph(&g, 4000);
+        assert!(
+            !dg.cycles.is_empty(),
+            "mutual includes must form a detected cycle"
+        );
+    }
+
+    #[test]
+    fn ts_import_cycles_are_detected() {
+        use crate::query::dependency_graph;
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { bFn } from \"./b\";\nexport function aFn() { return bFn(); }\n",
+            ),
+            (
+                "b.ts",
+                "import { aFn } from \"./a\";\nexport function bFn() { return aFn(); }\n",
+            ),
+        ]);
+        let dg = dependency_graph(&g, 4000);
+        assert!(
+            !dg.cycles.is_empty(),
+            "mutual relative imports must form a detected cycle"
+        );
+    }
+
+    #[test]
+    fn external_qualified_imports_stay_unbound() {
+        // An in-repo symbol that happens to share the imported name must not
+        // capture an external import (`std::process::Command` vs clap's
+        // `enum Command`) — no parent segment names an in-repo module.
+        let g = graph(&[
+            (
+                "main.rs",
+                "use std::process::Command;\nfn main() { let _c = Command::new(\"ls\"); }\n",
+            ),
+            ("cli.rs", "pub enum Command { Run, Help }\n"),
+        ]);
+        let from = module_of(&g, "main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "std::process::Command must not bind to the in-repo enum"
+        );
+    }
+
+    #[test]
+    fn crate_qualified_imports_bind() {
+        let g = graph(&[
+            (
+                "src/demo.rs",
+                "use crate::fresh::LiveGraph;\nfn main() { let _g: LiveGraph; }\n",
+            ),
+            ("src/fresh.rs", "pub struct LiveGraph;\n"),
+        ]);
+        let from = module_of(&g, "src/demo.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("crate:: path with real module binds"))
+            .unwrap();
+        assert_eq!(target.file, "src/fresh.rs");
+    }
+
+    #[test]
+    fn java_external_imports_with_colliding_dirs_stay_unbound() {
+        // A java-family `java` directory exists and an in-repo class shares
+        // the imported name — `java.util.List` still must not bind, because
+        // the chain `java/util` is not a real directory (a single colliding
+        // path segment is not evidence).
+        let g = graph(&[
+            (
+                "java/app/Svc.java",
+                "package java.app;\nimport java.util.List;\npublic class Svc { List l; }\n",
+            ),
+            ("List.java", "public class List {}\n"),
+        ]);
+        let from = module_of(&g, "java/app/Svc.java");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name.contains("List"))
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "java.util.List must not capture the in-repo List"
+        );
+    }
+
+    #[test]
+    fn bare_imports_bind_only_modules() {
+        // `import time` names a module; a same-named function in another
+        // file must not capture it.
+        let g = graph(&[
+            ("a.py", "import time\n\ndef helper():\n    pass\n"),
+            ("b.py", "def time():\n    pass\n"),
+        ]);
+        let from = module_of(&g, "a.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import time must not bind to the function named time"
+        );
+    }
+
+    #[test]
+    fn same_basename_headers_prefer_the_importers_directory() {
+        let g = graph(&[
+            ("lib/util/head.h", "int lu(void);\n"),
+            ("c/d/head.h", "int cd(void);\n"),
+            (
+                "c/d/main.c",
+                "#include \"head.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "c/d/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "head.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("head.h resolves")).unwrap();
+        assert_eq!(target.file, "c/d/head.h");
+    }
+    #[test]
+    fn relative_imports_apply_dotdot_components() {
+        // `../lib/b` from c/d/x.ts means c/lib/b — not the same-named module
+        // sitting in the importer's own directory.
+        let g = graph(&[
+            (
+                "c/d/x.ts",
+                "import { b } from \"../lib/b\";\nexport function x() { return b(); }\n",
+            ),
+            ("c/d/b.ts", "export function b() { return 1; }\n"),
+            ("c/lib/b.ts", "export function b() { return 2; }\n"),
+        ]);
+        let from = module_of(&g, "c/d/x.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("../lib/b resolves")).unwrap();
+        assert_eq!(target.file, "c/lib/b.ts");
+    }
+
+    #[test]
+    fn nodenext_js_extension_resolves_to_ts() {
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b.js\";\nexport function a() { return b(); }\n",
+            ),
+            ("b.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("./b.js means b.ts")).unwrap();
+        assert_eq!(target.file, "b.ts");
+    }
+
+    #[test]
+    fn crate_qualified_symbol_binds_only_inside_its_module() {
+        // `crate::a::B` must not capture a same-named B that lives outside
+        // module `a`, even though both are in-repo.
+        let g = graph(&[
+            ("src/x.rs", "use crate::a::B;\nfn main() { let _b: B; }\n"),
+            ("src/a.rs", "pub struct B;\n"),
+            ("src/b.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("B binds inside module a")).unwrap();
+        assert_eq!(target.file, "src/a.rs");
+    }
+
+    #[test]
+    fn std_path_with_in_repo_stem_stays_unbound() {
+        // An in-repo `sync.rs` must not vouch for `std::sync::Arc`.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use std::sync::Arc;\nfn main() { let _a: Arc; }\n",
+            ),
+            ("src/sync.rs", "pub struct Arc;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "std:: paths are never in-repo");
+    }
+
+    #[test]
+    fn external_crate_path_with_in_repo_stem_stays_unbound() {
+        // Not just the std prelude: a third-party path (`serde::de::…`)
+        // beside an in-repo `de.rs` must stay unbound — the parent chain
+        // must be proven against the *candidate's own* path.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use serde::de::Deserialize;\nfn main() { let _d: Deserialize; }\n",
+            ),
+            ("src/de.rs", "pub mod other { pub struct Noop; }\n"),
+            ("src/y.rs", "pub struct Deserialize;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "serde::de::Deserialize must not capture the in-repo Deserialize"
+        );
+    }
+
+    #[test]
+    fn python_dotted_submodule_binds() {
+        let g = graph(&[
+            ("pkg/__init__.py", "\n"),
+            ("pkg/lib.py", "def run(x):\n    return x\n"),
+            (
+                "app.py",
+                "import pkg.lib\n\ndef go():\n    return pkg.lib.run(1)\n",
+            ),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("pkg.lib binds")).unwrap();
+        assert_eq!(target.file, "pkg/lib.py");
+    }
+
+    #[test]
+    fn multi_component_include_honors_its_path() {
+        let g = graph(&[
+            ("sub/b.h", "int sub_b(void);\n"),
+            ("main/b.h", "int main_b(void);\n"),
+            (
+                "main/main.c",
+                "#include \"b.h\"\n#include \"../sub/b.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "main/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "../sub/b.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("../sub/b.h resolves")).unwrap();
+        assert_eq!(target.file, "sub/b.h");
+    }
+
+    #[test]
+    fn relative_file_import_with_missing_target_stays_unbound() {
+        // `../lib/b.ts` with no c/lib/b.ts must not fall back to the
+        // same-basename file in the importer's own directory.
+        let g = graph(&[
+            (
+                "c/d/x.ts",
+                "import { b } from \"../lib/b.ts\";\nexport function x() { return b(); }\n",
+            ),
+            ("c/d/b.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "c/d/x.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "../lib/b.ts with no target must not bind c/d/b.ts"
+        );
+    }
+
+    #[test]
+    fn relative_file_import_beats_same_basename_decoy() {
+        let g = graph(&[
+            (
+                "c/d/x.ts",
+                "import { b } from \"../lib/b.ts\";\nexport function x() { return b(); }\n",
+            ),
+            ("c/d/b.ts", "export function b() { return 1; }\n"),
+            ("c/lib/b.ts", "export function b() { return 2; }\n"),
+        ]);
+        let from = module_of(&g, "c/d/x.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("exact path resolves")).unwrap();
+        assert_eq!(target.file, "c/lib/b.ts");
+    }
+
+    #[test]
+    fn deep_crate_path_requires_full_ancestry() {
+        // `crate::a::b::B` must not bind a B that merely sits in some `b.rs`;
+        // the a/b chain has to be real.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a::b::B;\nfn main() { let _b: B; }\n",
+            ),
+            ("src/b.rs", "pub struct B;\n"),
+            ("src/a/b.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("a/b.rs wins over plain b.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/a/b.rs");
+    }
+
+    #[test]
+    fn external_crate_path_with_namesake_in_matched_module_stays_unbound() {
+        // Even a namesake Deserialize living IN a de.rs must not capture
+        // `serde::de::Deserialize`: serde:: is an external root.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use serde::de::Deserialize;\nfn main() { let _d: Deserialize; }\n",
+            ),
+            ("src/de.rs", "pub struct Deserialize;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "serde::de::Deserialize must not capture the in-repo de::Deserialize"
+        );
+    }
+
+    #[test]
+    fn std_root_guard_is_rust_only() {
+        // `core` is a Rust prelude root, but in Python `import core.utils`
+        // may name a real local package.
+        let g = graph(&[
+            ("core/utils.py", "def helper():\n    return 1\n"),
+            (
+                "app.py",
+                "import core.utils\n\ndef go():\n    return core.utils.helper()\n",
+            ),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("core.utils binds in Python")).unwrap();
+        assert_eq!(target.file, "core/utils.py");
+    }
+
+    #[test]
+    fn nested_module_import_binds() {
+        // `use crate::a::b;` imports a MODULE: the final name is part of the
+        // module path, not a symbol inside `a`.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a::b;\nfn main() { let _t: b::Thing; }\n",
+            ),
+            ("src/a/b.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("crate::a::b binds")).unwrap();
+        assert_eq!(target.file, "src/a/b.rs");
+    }
+
+    #[test]
+    fn self_scoped_import_stays_in_the_callers_module() {
+        // `self::B` must bind only within the caller's own module — not a
+        // same-named B in an unrelated file.
+        let g = graph(&[
+            ("src/a.rs", "use self::B;\nfn run() { let _b: B; }\n"),
+            ("src/unrelated.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/a.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "self::B with no local B must not bind src/unrelated.rs"
+        );
+    }
+
+    #[test]
+    fn super_scoped_import_binds_the_parent_module() {
+        let g = graph(&[
+            ("src/a/b.rs", "use super::B;\npub fn run() { let _b: B; }\n"),
+            ("src/a.rs", "pub struct B;\n"),
+            ("src/other.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/a/b.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("super::B binds src/a.rs")).unwrap();
+        assert_eq!(target.file, "src/a.rs");
+    }
+
+    #[test]
+    fn super_with_remaining_path_binds_that_submodule() {
+        // `super::child::B` from src/a/x.rs means src/a/child — not src/a.
+        let g = graph(&[
+            (
+                "src/a/x.rs",
+                "use super::child::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("src/a.rs", "pub struct B;\n"),
+            ("src/a/child.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/a/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("super::child binds src/a/child.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/a/child.rs");
+    }
+
+    #[test]
+    fn crate_root_import_binds_only_root_files() {
+        // `crate::B` names the crate root: a namesake in an unrelated
+        // module must not capture it; one in the root lib.rs binds.
+        let g = graph(&[
+            ("src/lib.rs", "pub struct B;\n"),
+            ("src/unrelated.rs", "pub struct B;\n"),
+            ("src/x.rs", "use crate::B;\nfn main() { let _b: B; }\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("crate::B binds the root B")).unwrap();
+        assert_eq!(target.file, "src/lib.rs");
+    }
+
+    #[test]
+    fn root_level_module_import_binds() {
+        // `use crate::a;` imports the root-level module src/a.rs — not a
+        // symbol at the crate root.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a;\nfn main() { let _m: a::Thing; }\n",
+            ),
+            ("src/a.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("crate::a binds src/a.rs")).unwrap();
+        assert_eq!(target.file, "src/a.rs");
+    }
+
+    #[test]
+    fn duplicate_directory_basenames_do_not_confuse_affinity() {
+        // app/include/ and vendor/include/ share their final segment; the
+        // include from app/include must bind app's header, not whichever
+        // file got the lower symbol id.
+        let g = graph(&[
+            ("app/include/head.h", "int app_head(void);\n"),
+            ("vendor/include/head.h", "int vendor_head(void);\n"),
+            (
+                "app/include/main.c",
+                "#include \"head.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "app/include/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "head.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("same full directory wins")).unwrap();
+        assert_eq!(target.file, "app/include/head.h");
+    }
+
+    #[test]
+    fn multi_component_include_with_missing_path_stays_unbound() {
+        // `#include "missing/b.h"` with no file at that path must not fall
+        // back to an unrelated same-basename header.
+        let g = graph(&[
+            ("main/b.h", "int main_b(void);\n"),
+            (
+                "main/main.c",
+                "#include \"missing/b.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "main/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "missing/b.h must not bind main/b.h");
+    }
+
+    #[test]
+    fn crate_root_module_rejects_nested_namesake() {
+        // `use crate::a;` with only src/nested/a.rs present stays unbound —
+        // a root-level module is not a nested one.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a;\nfn main() { let _m: a::Thing; }\n",
+            ),
+            ("src/nested/a.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "crate::a must not bind src/nested/a.rs");
+    }
+
+    #[test]
+    fn dotted_relative_module_import_binds() {
+        // `./b.test` targets b.test.ts; the lookup name is the stem before
+        // the first dot (`b`), and the exact path comparison carries the
+        // dotted basename.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b.test\";\nexport function a() { return b(); }\n",
+            ),
+            ("b.test.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("./b.test binds b.test.ts")).unwrap();
+        assert_eq!(target.file, "b.test.ts");
+    }
+
+    #[test]
+    fn header_beside_importer_outranks_root_namesake() {
+        // `#include "head.h"` from src/main.c: the header in the importer's
+        // directory wins over a same-named file at the exact import path
+        // root (C searches the includer's directory first).
+        let g = graph(&[
+            ("head.h", "int root_head(void);\n"),
+            ("src/head.h", "int src_head(void);\n"),
+            (
+                "src/main.c",
+                "#include \"head.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "src/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "head.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("src/head.h wins")).unwrap();
+        assert_eq!(target.file, "src/head.h");
+    }
+
+    #[test]
+    fn module_chain_binds_the_module_not_a_symbol_namesake() {
+        // `use crate::a::B;` where src/a/B.rs holds a struct B: the module
+        // path `crate::a::B` IS the file src/a/B.rs, so the import binds its
+        // module symbol — never the struct inside it (that would be
+        // `crate::a::B::B`).
+        let g = graph(&[
+            ("src/x.rs", "use crate::a::B;\nfn main() { let _b: B; }\n"),
+            ("src/a/B.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("the module crate::a::B binds"))
+            .unwrap();
+        assert_eq!(target.file, "src/a/B.rs");
+        assert_eq!(
+            target.kind,
+            SymbolKind::Module,
+            "the struct namesake must not capture the import"
+        );
+    }
+
+    #[test]
+    fn nested_workspace_crate_paths_bind() {
+        // A workspace nests crates under crates/foo/src — `crate::a::B`
+        // from inside that crate resolves against ITS src root.
+        let g = graph(&[
+            (
+                "crates/foo/src/x.rs",
+                "use crate::a::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("crates/foo/src/a.rs", "pub struct B;\n"),
+            ("crates/bar/src/a.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "crates/foo/src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("binds the own-crate a.rs")).unwrap();
+        assert_eq!(target.file, "crates/foo/src/a.rs");
+    }
+
+    #[test]
+    fn relative_import_binds_directory_index_module() {
+        // `./b` may target b/index.ts, whose module is named by the
+        // directory.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b\";\nexport function a() { return b(); }\n",
+            ),
+            ("b/index.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("./b binds b/index.ts")).unwrap();
+        assert_eq!(target.file, "b/index.ts");
+    }
+
+    #[test]
+    fn multi_component_include_prefers_importer_relative_target() {
+        // `#include "sub/b.h"` from src/main.c: src/sub/b.h (the
+        // importer-relative path) beats a same-suffix header at the root.
+        let g = graph(&[
+            ("sub/b.h", "int root_b(void);\n"),
+            ("src/sub/b.h", "int src_b(void);\n"),
+            (
+                "src/main.c",
+                "#include \"sub/b.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "src/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name == "sub/b.h")
+            .unwrap();
+        let target = g.symbol(e.to.expect("src/sub/b.h wins")).unwrap();
+        assert_eq!(target.file, "src/sub/b.h");
+    }
+
+    #[test]
+    fn crate_root_symbol_does_not_cross_workspace_crates() {
+        // `crate::B` from crates/foo must not bind the sibling crate's
+        // root file when its own has no B.
+        let g = graph(&[
+            (
+                "crates/foo/src/x.rs",
+                "use crate::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("crates/bar/src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "crates/foo/src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "crate::B must not bind the sibling crate's lib.rs"
+        );
+    }
+
+    #[test]
+    fn crate_root_symbol_binds_own_root_file() {
+        let g = graph(&[
+            (
+                "crates/foo/src/x.rs",
+                "use crate::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("crates/foo/src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "crates/foo/src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("own crate root binds")).unwrap();
+        assert_eq!(target.file, "crates/foo/src/lib.rs");
+    }
+
+    #[test]
+    fn self_scoped_from_root_file_reaches_submodules() {
+        // `self::child::B` from src/lib.rs scopes to the crate root, so
+        // src/child.rs qualifies (lib.rs is the root module, not a module
+        // named `lib` beside it).
+        let g = graph(&[
+            (
+                "src/lib.rs",
+                "use self::child::B;\nfn run() { let _b: B; }\n",
+            ),
+            ("src/child.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/lib.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("self::child binds src/child.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/child.rs");
+    }
+
+    #[test]
+    fn self_scoped_from_main_does_not_reach_the_library() {
+        // src/main.rs is a separate (binary) crate root: `self::B` there
+        // cannot reach the library crate's items in src/lib.rs.
+        let g = graph(&[
+            ("src/main.rs", "use self::B;\nfn main() { let _b: B; }\n"),
+            ("src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "self::B from main.rs must not bind the library's B"
+        );
+    }
+
+    #[test]
+    fn python_dotted_chain_binds_only_modules() {
+        // `import pkg.lib.run` imports the MODULE run (pkg/lib/run.py) —
+        // binding the function run in pkg/lib.py would be `from pkg.lib
+        // import run`, a different statement.
+        let g = graph(&[
+            ("pkg/lib.py", "def run(x):\n    return x\n"),
+            ("app.py", "import pkg.lib.run\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import pkg.lib.run must not bind the function run in pkg/lib.py"
+        );
+    }
+
+    #[test]
+    fn python_dotted_chain_binds_a_real_submodule() {
+        let g = graph(&[
+            ("pkg/lib/run.py", "def go(x):\n    return x\n"),
+            (
+                "app.py",
+                "import pkg.lib.run\n\ndef main():\n    return pkg.lib.run.go(1)\n",
+            ),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("pkg.lib.run binds pkg/lib/run.py"))
+            .unwrap();
+        assert_eq!(target.file, "pkg/lib/run.py");
+        assert_eq!(target.kind, SymbolKind::Module);
+    }
+
+    #[test]
+    fn crate_import_from_main_does_not_reach_the_library() {
+        // `crate::B` from the binary root binds only main.rs's own B —
+        // lib.rs is a separate crate.
+        let g = graph(&[
+            ("src/main.rs", "use crate::B;\nfn main() { let _b: B; }\n"),
+            ("src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "crate::B from main.rs must not bind lib.rs");
+
+        let g2 = graph(&[
+            ("src/main.rs", "use crate::B;\nfn main() { let _b: B; }\n"),
+            ("src/main.rs", "fn placeholder() {}\n"),
+        ]);
+        let _ = g2; // single-file case covered by the next fixture
+        let g3 = graph(&[
+            (
+                "src/main.rs",
+                "use crate::B;\nfn main() { let _b: B; }\npub struct B;\n",
+            ),
+            ("src/lib.rs", "pub struct B;\n"),
+        ]);
+        let from3 = module_of(&g3, "src/main.rs");
+        let e3 = g3
+            .out_edges(from3)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g3.symbol(e3.to.expect("own root B binds")).unwrap();
+        assert_eq!(target.file, "src/main.rs");
+    }
+
+    #[test]
+    fn relative_import_prefers_file_over_directory_module() {
+        // `./b` with BOTH b.ts and b/index.ts present: the file wins.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b\";\nexport function a() { return b(); }\n",
+            ),
+            ("b.ts", "export function b() { return 1; }\n"),
+            ("b/index.ts", "export function b() { return 2; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("b.ts beats b/index.ts")).unwrap();
+        assert_eq!(target.file, "b.ts");
+    }
+
+    #[test]
+    fn internal_dotdot_include_resolves_components() {
+        // `#include "sub/../b.h"` from src/main.c means src/b.h — the `..`
+        // pops `sub`, it does not simply vanish.
+        let g = graph(&[
+            ("src/sub/b.h", "int sub_b(void);\n"),
+            ("src/b.h", "int top_b(void);\n"),
+            (
+                "src/main.c",
+                "#include \"sub/../b.h\"\nint main(void) { return 0; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "src/main.c");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("src/b.h wins")).unwrap();
+        assert_eq!(target.file, "src/b.h");
+    }
+
+    #[test]
+    fn dotted_chain_rejects_sibling_module_namesake() {
+        // `pkg.lib.run` must not bind a run that lives in pkg/lib/unrelated.py
+        // — its module is pkg.lib.unrelated.
+        let g = graph(&[
+            ("pkg/lib/unrelated.py", "def run(x):\n    return x\n"),
+            (
+                "app.py",
+                "import pkg.lib.run\n\ndef go():\n    return pkg.lib.run(1)\n",
+            ),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "pkg.lib.run must not bind pkg/lib/unrelated.py's run"
+        );
+    }
+
+    #[test]
+    fn self_scoped_from_main_reaches_child_modules() {
+        // `self::child::B` from src/main.rs anchors at the crate root, so
+        // src/child.rs qualifies (the binary root owns its child modules).
+        let g = graph(&[
+            (
+                "src/main.rs",
+                "use self::child::B;\nfn main() { let _b: B; }\n",
+            ),
+            ("src/child.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("self::child binds src/child.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/child.rs");
+    }
+
+    #[test]
+    fn bare_self_import_from_root_binds_child_module() {
+        // `use self::child;` from src/main.rs imports the child module
+        // itself (not an item of the sibling library root).
+        let g = graph(&[
+            (
+                "src/main.rs",
+                "use self::child;\nfn main() { let _m: child::Thing; }\n",
+            ),
+            ("src/child.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/main.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("self::child binds src/child.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/child.rs");
+        assert_eq!(target.kind, SymbolKind::Module);
+    }
+
+    #[test]
+    fn crate_import_from_module_abstains_when_both_roots_exist() {
+        // With lib.rs AND main.rs both present, a module file's crate
+        // ownership is unknowable: `crate::B` from src/child.rs abstains
+        // rather than guessing the library root.
+        let g = graph(&[
+            ("src/child.rs", "use crate::B;\nfn run() { let _b: B; }\n"),
+            ("src/lib.rs", "pub struct B;\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "crate::B from a module file must abstain when both roots exist"
+        );
+    }
+
+    #[test]
+    fn binary_only_tree_binds_its_root() {
+        // No lib.rs at all: `crate::B` from a module of the binary crate
+        // binds main.rs's B.
+        let g = graph(&[
+            ("src/child.rs", "use crate::B;\nfn run() { let _b: B; }\n"),
+            ("src/main.rs", "pub struct B;\nfn main() {}\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("the only root binds")).unwrap();
+        assert_eq!(target.file, "src/main.rs");
+    }
+
+    #[test]
+    fn nested_lib_rs_is_not_the_callers_root() {
+        // `crate::B` from src/x.rs must not bind a B in src/nested/lib.rs —
+        // that lib.rs is the nested module's root.
+        let g = graph(&[
+            ("src/x.rs", "use crate::B;\nfn run() { let _b: B; }\n"),
+            ("src/nested/lib.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "nested lib.rs is not the crate root");
+    }
+
+    #[test]
+    fn super_to_root_abstains_when_both_roots_exist() {
+        // `super::B` from src/child.rs climbing to the crate root: with both
+        // lib.rs and main.rs present, the root item's crate is ambiguous.
+        let g = graph(&[
+            ("src/child.rs", "use super::B;\nfn run() { let _b: B; }\n"),
+            ("src/lib.rs", "pub struct B;\n"),
+            ("src/main.rs", "fn main() {}\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "super::B to the root must abstain when both roots exist"
+        );
+    }
+
+    #[test]
+    fn super_to_root_binds_the_single_root() {
+        let g = graph(&[
+            ("src/child.rs", "use super::B;\nfn run() { let _b: B; }\n"),
+            ("src/main.rs", "pub struct B;\nfn main() {}\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("the single root binds")).unwrap();
+        assert_eq!(target.file, "src/main.rs");
+    }
+
+    #[test]
+    fn explicit_entry_file_import_binds() {
+        // `./b/index` names b/index.ts explicitly.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import { b } from \"./b/index\";\nexport function a() { return b(); }\n",
+            ),
+            ("b/index.ts", "export function b() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("./b/index binds b/index.ts")).unwrap();
+        assert_eq!(target.file, "b/index.ts");
+    }
+
+    #[test]
+    fn nested_lib_does_not_make_ownership_ambiguous() {
+        // src/nested/lib.rs is not the caller's crate root: with only
+        // src/main.rs at the root, crate::B from a module file binds it.
+        let g = graph(&[
+            ("src/child.rs", "use crate::B;\nfn run() { let _b: B; }\n"),
+            ("src/main.rs", "pub struct B;\nfn main() {}\n"),
+            ("src/nested/lib.rs", "pub mod x { pub struct Noop; }\n"),
+        ]);
+        let from = module_of(&g, "src/child.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("the real root binds")).unwrap();
+        assert_eq!(target.file, "src/main.rs");
+    }
+
+    #[test]
+    fn caller_relative_scope_is_exact() {
+        // `self::child::B` from src/a.rs must not bind a same-suffix path in
+        // an unrelated tree when the local target is absent.
+        let g = graph(&[
+            ("src/a.rs", "use self::child::B;\nfn run() { let _b: B; }\n"),
+            ("vendor/other/src/a/child.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/a.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "self::child::B must not bind vendor/other/src/a/child.rs"
+        );
+    }
+
+    #[test]
+    fn python_dotted_import_binds_directory_package() {
+        // `import pkg.sub` resolves the package pkg/sub (__init__.py), whose
+        // module identity is [pkg, sub].
+        let g = graph(&[
+            ("pkg/sub/__init__.py", "\n"),
+            ("app.py", "import pkg.sub\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("pkg.sub binds the package")).unwrap();
+        assert_eq!(target.file, "pkg/sub/__init__.py");
+        assert_eq!(target.kind, SymbolKind::Module);
+    }
+
+    #[test]
+    fn python_missing_submodule_stays_unbound() {
+        // `import pkg.missing` with only the package present must not bind
+        // the parent package as the nonexistent submodule.
+        let g = graph(&[
+            ("pkg/__init__.py", "\n"),
+            ("app.py", "import pkg.missing\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import pkg.missing must not bind the pkg package itself"
+        );
+    }
+
+    #[test]
+    fn crate_root_module_import_binds_mod_rs() {
+        // `use crate::a;` with the module as a directory: src/a/mod.rs.
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use crate::a;\nfn main() { let _m: a::Thing; }\n",
+            ),
+            ("src/a/mod.rs", "pub struct Thing;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("crate::a binds src/a/mod.rs"))
+            .unwrap();
+        assert_eq!(target.file, "src/a/mod.rs");
+    }
+
+    #[test]
+    fn bare_python_package_import_binds_init() {
+        // `import pkg` with the package as a directory: pkg/__init__.py.
+        let g = graph(&[
+            ("pkg/__init__.py", "\n"),
+            ("app.py", "import pkg\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g
+            .symbol(e.to.expect("import pkg binds the package"))
+            .unwrap();
+        assert_eq!(target.file, "pkg/__init__.py");
+        assert_eq!(target.kind, SymbolKind::Module);
+    }
+
+    #[test]
+    fn bare_import_does_not_bind_arbitrary_packages() {
+        // `import time` must stay unbound even when an unrelated package
+        // (__init__.py module) is in the candidate set.
+        let g = graph(&[
+            ("pkg/__init__.py", "\n"),
+            ("app.py", "import time\n\ndef go():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import time must not bind the unrelated pkg package"
+        );
+    }
+
+    #[test]
+    fn bare_import_does_not_bind_across_the_tree() {
+        // `import b` from py/a.py must not reach a same-named module in an
+        // unrelated directory — that edge (and its cycle) does not exist
+        // under any path configuration.
+        let g = graph(&[
+            (
+                "py/a.py",
+                "import b\n\ndef alpha(x):\n    return b.beta(x)\n",
+            ),
+            ("other/deep/b.py", "def beta(x):\n    return x\n"),
+        ]);
+        let from = module_of(&g, "py/a.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import b must not bind other/deep/b.py from py/a.py"
+        );
+    }
+
+    #[test]
+    fn bare_import_binds_sibling_and_top_level() {
+        // Both anchors are legitimate: a sibling module and a top-level
+        // package.
+        let g = graph(&[
+            (
+                "py/a.py",
+                "import b\nimport top\n\ndef go():\n    return 1\n",
+            ),
+            ("py/b.py", "def beta(x):\n    return x\n"),
+            ("top/__init__.py", "\n"),
+        ]);
+        let from = module_of(&g, "py/a.py");
+        let mut bound = std::collections::BTreeSet::new();
+        for e in g.out_edges(from).filter(|e| e.kind == EdgeKind::Imports) {
+            if let Some(id) = e.to {
+                bound.insert(g.symbol(id).unwrap().file.clone());
+            }
+        }
+        assert_eq!(
+            bound,
+            ["py/b.py".to_string(), "top/__init__.py".to_string()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn entry_file_symbol_namesakes_are_not_module_candidates() {
+        // A function named `index` must never enter the directory-module
+        // candidate set: `use crate::a::B` cannot bind it.
+        let g = graph(&[
+            ("src/x.rs", "use crate::a::B;\nfn main() { let _b: B; }\n"),
+            ("src/a.rs", "pub fn index() {}\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "fn index must not capture use crate::a::B");
+    }
+
+    #[test]
+    fn external_crate_path_with_matching_module_stays_unbound() {
+        // `use config::Config;` names the external `config` crate — an
+        // in-repo src/config.rs sharing the name is not it (in-crate Rust
+        // paths are crate::/self::/super::-prefixed).
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use config::Config;\nfn main() { let _c: Config; }\n",
+            ),
+            ("src/config.rs", "pub struct Config;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "config::Config must not bind the in-repo src/config.rs"
+        );
+    }
+
+    #[test]
+    fn bare_imports_are_python_and_ruby_only() {
+        // JS/TS bare imports mean node_modules, Go's mean the standard
+        // library, Rust's the extern prelude: none may bind a same-named
+        // sibling file.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import \"axios\";\nexport function a() { return 1; }\n",
+            ),
+            ("axios.ts", "export function get() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "import \"axios\" must not bind ./axios.ts");
+
+        let g = graph(&[
+            (
+                "a.go",
+                "package a\nimport \"errors\"\nfunc f() { _ = errors.New }\n",
+            ),
+            ("errors.go", "package a\nfunc New() {}\n"),
+        ]);
+        let from = module_of(&g, "a.go");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import \"errors\" must not bind ./errors.go"
+        );
+
+        let g = graph(&[
+            ("src/x.rs", "use serde;\nfn main() { let _s: serde::S; }\n"),
+            ("src/serde.rs", "pub struct S;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "use serde; must not bind ./serde.rs");
+    }
+
+    #[test]
+    fn entry_file_named_import_reports_no_false_tie() {
+        // `import index` where index.py is the unique target: the candidate
+        // appears in both the primary and the alt buckets — the binding must
+        // report zero alternatives.
+        let g = graph(&[
+            (
+                "app.py",
+                "import index\n\ndef go():\n    return index.f()\n",
+            ),
+            ("index.py", "def f():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("index.py binds")).unwrap();
+        assert_eq!(target.file, "index.py");
+        assert_eq!(e.alternatives, 0, "a unique target is not a tie");
+    }
+
+    #[test]
+    fn non_relative_js_import_with_extension_stays_unbound() {
+        // `import "chart.js"` (no `./`) is a node_modules reference: a
+        // same-basename in-repo file must not capture it.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import \"chart.js\";\nexport function a() { return 1; }\n",
+            ),
+            ("chart.js", "export function draw() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import \"chart.js\" must not bind the in-repo chart.js"
+        );
+    }
+
+    #[test]
+    fn container_mod_rs_does_not_capture_symbol_imports() {
+        // `crate::a::B` with module a as src/a/mod.rs: the struct B inside
+        // it binds — the mod.rs container module does not outrank it, and a
+        // nonexistent B binds nothing at all.
+        let g = graph(&[
+            ("src/x.rs", "use crate::a::B;\nfn main() { let _b: B; }\n"),
+            ("src/a/mod.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("struct B inside a binds")).unwrap();
+        assert_eq!(target.file, "src/a/mod.rs");
+        assert_eq!(target.kind, SymbolKind::Struct);
+
+        let g2 = graph(&[
+            ("src/x.rs", "use crate::a::Missing;\nfn main() {}\n"),
+            ("src/a/mod.rs", "pub struct Other;\n"),
+        ]);
+        let from2 = module_of(&g2, "src/x.rs");
+        let e2 = g2
+            .out_edges(from2)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e2.to.is_none(),
+            "a nonexistent item must not bind the container module"
+        );
+    }
+
+    #[test]
+    fn dotted_package_import_binds_under_nested_root() {
+        // A real package chain (`app/store`) deep in the tree binds even
+        // though it is not rooted at the repo root.
+        let g = graph(&[
+            (
+                "tests/eval/java/app/store/Repo.java",
+                "package app.store;\npublic class Repo {}\n",
+            ),
+            (
+                "tests/eval/java/app/svc/Svc.java",
+                "package app.svc;\nimport app.store.Repo;\npublic class Svc { Repo r; }\n",
+            ),
+        ]);
+        let from = module_of(&g, "tests/eval/java/app/svc/Svc.java");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports && e.to_name.contains("Repo"))
+            .unwrap();
+        let target = g.symbol(e.to.expect("app.store.Repo binds")).unwrap();
+        assert_eq!(target.file, "tests/eval/java/app/store/Repo.java");
     }
 }

@@ -13,7 +13,7 @@
 
 ![codescope indexing itself and answering blast-radius queries](demo.gif)
 
-*codescope v0.1 indexing its own repo — 196 symbols, 1,322 edges in 188 ms — then a summary and a blast-radius query. Recorded from the actual binary with [asciinema](https://asciinema.org) + [agg](https://github.com/asciinema/agg).*
+*codescope v0.1 indexing its own repo — 196 symbols, 1,322 edges in 188 ms — then a summary and a blast-radius query. Recorded from the actual binary with [asciinema](https://asciinema.org) + [agg](https://github.com/asciinema/agg). (The repo has grown since: at HEAD the same self-index is ~620 symbols / 4.5k edges in ~0.7 s.)*
 
 `codescope` indexes any repository into a precise, queryable structural graph and
 serves it to AI agents over **MCP** (and CLI/JSON). Instead of letting an agent
@@ -153,11 +153,15 @@ files changed since (every result carries `freshness`; ADR-0020). See
 
 Measured on a 4-core container (release build) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md):
 
-- Cold index **100k LOC in ~0.2 s**; **~1M LOC in ~1.6 s**.
+- Cold index **100k LOC in ~0.2 s**; **~1M LOC in ~1.6 s**. Expect roughly
+  linear slowdown on smaller machines: a 2-core Codespace indexes 125k dense
+  LOC in ~0.9 s and a 1.15M-LOC / 1.2M-edge corpus in ~17 s.
 - Incremental re-index of one changed file in **~55 ms**; queries auto-refresh
   after edits (stat check ~4 ms / 1-file patch ~36 ms on a 264-file Java repo —
   see ADR-0020).
-- In-process query latency **< 2 ms** for every query type.
+- In-process query latency **< 2 ms** for every query type on that hardware —
+  graph traversals are µs-scale; the two full-scan queries (`search`,
+  `summary`) land at ~1.4–1.7 ms on 4 cores and ~1.2–6.8 ms on 2 cores.
 - On-disk index size is the one PRD target not met (~75% vs. <15%); the cause
   and remediation are documented honestly in the benchmarks doc and ADR-0005.
 
@@ -173,7 +177,7 @@ stay unbound) — see [`docs/EVAL.md`](docs/EVAL.md):
 | **1.00** | **0.97** | **0.98** |
 
 `find` relevance on 16 behavior-phrased queries over codescope's own source:
-**MRR 0.69, Recall@5 0.88**. Both are regression-gated in `cargo test`; run
+**MRR 0.70, Recall@5 0.88**. Both are regression-gated in `cargo test`; run
 `scripts/eval` for the full report.
 
 ## How it works
@@ -189,7 +193,10 @@ repo → Walker (ignore-aware, parallel) → tree-sitter parsers → symbols, do
 - **Parsing:** tree-sitter (robust error recovery, incremental).
 - **Resolution:** two-tier — fast tree-sitter heuristics now (labeled
   `heuristic`: owner/receiver-aware, import-aware, local receiver-type
-  inference, abstains rather than guessing — ADR-0018), with a SCIP precision tier designed in (labeled `precise`).
+  inference, and import edges that bind only with in-repo evidence — a
+  qualified path like `std::process::Command` stays unbound rather than
+  captured by an in-repo namesake, and imports never bind across language
+  families; ADR-0018, ADR-0023), with a SCIP precision tier designed in (labeled `precise`).
 - **Storage:** embedded, single-file, memory-mapped redb. No external DB.
 - **Concurrency:** rayon for parallel parsing/extraction, resolution and search indexing.
 - **Ranking & search:** personalized PageRank (repo map, summary), BM25F over
