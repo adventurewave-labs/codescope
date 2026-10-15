@@ -13,7 +13,7 @@
 
 ![codescope indexing itself and answering blast-radius queries](demo.gif)
 
-*codescope v0.1 indexing its own repo — 196 symbols, 1,322 edges in 188 ms — then a summary and a blast-radius query. Recorded from the actual binary with [asciinema](https://asciinema.org) + [agg](https://github.com/asciinema/agg). (The repo has grown since: at HEAD the same self-index is ~550 symbols / 3.7k edges in ~0.3 s.)*
+*codescope v0.1 indexing its own repo — 196 symbols, 1,322 edges in 188 ms — then a summary and a blast-radius query. Recorded from the actual binary with [asciinema](https://asciinema.org) + [agg](https://github.com/asciinema/agg). (The repo has grown since: at HEAD the same self-index is ~620 symbols / 4.5k edges in ~0.7 s.)*
 
 `codescope` indexes any repository into a precise, queryable structural graph and
 serves it to AI agents over **MCP** (and CLI/JSON). Instead of letting an agent

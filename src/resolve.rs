@@ -884,6 +884,15 @@ fn proven_for_candidate(
         }
     }
     let bare = caller_relative && parent.is_empty();
+    // Rust 2018+: an in-crate path is `crate::`/`self::`/`super::`-prefixed
+    // (or crate-name-qualified, which ADR-0023 abstains on). A bare
+    // two-segment `::` path from Rust is therefore an external crate
+    // reference (`config::Config`) and never binds — not even to a module
+    // that happens to share the crate's name.
+    if caller.language == Language::Rust && raw.contains("::") && !crate_rooted && !caller_relative
+    {
+        return false;
+    }
     if caller_relative {
         let mut caller_segs = module_segments(caller.file, Some(caller.language));
         if supers > 0 {
@@ -2661,6 +2670,29 @@ mod tests {
             .find(|e| e.kind == EdgeKind::Imports)
             .unwrap();
         assert!(e.to.is_none(), "fn index must not capture use crate::a::B");
+    }
+
+    #[test]
+    fn external_crate_path_with_matching_module_stays_unbound() {
+        // `use config::Config;` names the external `config` crate — an
+        // in-repo src/config.rs sharing the name is not it (in-crate Rust
+        // paths are crate::/self::/super::-prefixed).
+        let g = graph(&[
+            (
+                "src/x.rs",
+                "use config::Config;\nfn main() { let _c: Config; }\n",
+            ),
+            ("src/config.rs", "pub struct Config;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "config::Config must not bind the in-repo src/config.rs"
+        );
     }
 
     #[test]
