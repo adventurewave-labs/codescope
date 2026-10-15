@@ -609,7 +609,9 @@ fn resolve_import(
         // collect those candidates; the path evidence does the filtering.
         for alt in ["index", "__init__", "mod"] {
             if let Some(v) = name_index.get(alt) {
-                cand_vec.extend(v.iter());
+                // Only the entry files' MODULE symbols: a `fn index`
+                // sharing the name is not a directory-module candidate.
+                cand_vec.extend(v.iter().filter(|c| c.kind == SymbolKind::Module));
             }
         }
     }
@@ -2643,6 +2645,22 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+    }
+
+    #[test]
+    fn entry_file_symbol_namesakes_are_not_module_candidates() {
+        // A function named `index` must never enter the directory-module
+        // candidate set: `use crate::a::B` cannot bind it.
+        let g = graph(&[
+            ("src/x.rs", "use crate::a::B;\nfn main() { let _b: B; }\n"),
+            ("src/a.rs", "pub fn index() {}\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "fn index must not capture use crate::a::B");
     }
 
     #[test]
