@@ -71,8 +71,9 @@ same-directory candidates get +4. A file never binds an import to itself.
   namesakes; on codescope's own source the `std::` imports stay unbound while
   every `crate::`-qualified one binds, so the summary's bound-count gains only
   real edges.
-- `find` relevance improved as a side effect (MRR 0.693 → 0.730): resolved
-  import edges feed import-aware scoring and centrality.
+- `find` relevance improved as a side effect (MRR 0.693 → 0.702 after the
+  bare-import locality anchoring; 0.730 at an intermediate stage before it):
+  resolved import edges feed import-aware scoring and centrality.
 - The 85-site call-resolution eval is unchanged (1.00 / 0.97 / 0.98) — call
   edges take the pre-existing scoring path untouched.
 - Known limits: Rust grouped (use-tree) imports (`use a::{b, c}`) and glob
