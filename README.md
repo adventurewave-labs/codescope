@@ -177,7 +177,7 @@ stay unbound) — see [`docs/EVAL.md`](docs/EVAL.md):
 | **1.00** | **0.97** | **0.98** |
 
 `find` relevance on 16 behavior-phrased queries over codescope's own source:
-**MRR 0.73, Recall@5 0.88**. Both are regression-gated in `cargo test`; run
+**MRR 0.70, Recall@5 0.88**. Both are regression-gated in `cargo test`; run
 `scripts/eval` for the full report.
 
 ## How it works

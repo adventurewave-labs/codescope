@@ -701,6 +701,16 @@ fn resolve_import(
                      // `import core.utils` in Python may be a real local package)
     }
 
+    let caller_dir: Vec<String> = {
+        let mut parts: Vec<String> = caller
+            .file
+            .split(['/', '\\'])
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(String::from)
+            .collect();
+        parts.pop();
+        parts
+    };
     let mut best: Option<(SymbolId, u32)> = None;
     let mut ties = 0u16;
     for c in cands {
@@ -721,14 +731,22 @@ fn resolve_import(
                 continue;
             }
         } else {
-            // A bare import names a module — never a function — and an
-            // entry-file candidate (pkg/__init__.py) qualifies only when
-            // its module identity IS the imported name (`import pkg`), so
-            // `import time` cannot bind an arbitrary package.
+            // A bare import names a module — never a function — and its
+            // identity must anchor at the repository root (a top-level
+            // module or package, `import pkg` → pkg/__init__.py) or at the
+            // importer's own directory (a sibling, py/a.py → py/b.py): a
+            // same-named module anywhere else in the tree is not what any
+            // path configuration would resolve to, and binding it would
+            // invent edges (and cycles) that do not exist.
             if c.kind != SymbolKind::Module {
                 continue;
             }
-            if candidate_segments(c).last().is_some_and(|s| s != name) {
+            let identity = candidate_segments(c);
+            let anchored_at_root = identity.len() == 1 && identity[0] == name;
+            let anchored_at_caller_dir = identity.len() == caller_dir.len() + 1
+                && identity[..identity.len() - 1] == caller_dir[..]
+                && identity.last().is_some_and(|s| s == name);
+            if !anchored_at_root && !anchored_at_caller_dir {
                 continue;
             }
         }
@@ -2574,6 +2592,56 @@ mod tests {
         assert!(
             e.to.is_none(),
             "import time must not bind the unrelated pkg package"
+        );
+    }
+
+    #[test]
+    fn bare_import_does_not_bind_across_the_tree() {
+        // `import b` from py/a.py must not reach a same-named module in an
+        // unrelated directory — that edge (and its cycle) does not exist
+        // under any path configuration.
+        let g = graph(&[
+            (
+                "py/a.py",
+                "import b\n\ndef alpha(x):\n    return b.beta(x)\n",
+            ),
+            ("other/deep/b.py", "def beta(x):\n    return x\n"),
+        ]);
+        let from = module_of(&g, "py/a.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import b must not bind other/deep/b.py from py/a.py"
+        );
+    }
+
+    #[test]
+    fn bare_import_binds_sibling_and_top_level() {
+        // Both anchors are legitimate: a sibling module and a top-level
+        // package.
+        let g = graph(&[
+            (
+                "py/a.py",
+                "import b\nimport top\n\ndef go():\n    return 1\n",
+            ),
+            ("py/b.py", "def beta(x):\n    return x\n"),
+            ("top/__init__.py", "\n"),
+        ]);
+        let from = module_of(&g, "py/a.py");
+        let mut bound = std::collections::BTreeSet::new();
+        for e in g.out_edges(from).filter(|e| e.kind == EdgeKind::Imports) {
+            if let Some(id) = e.to {
+                bound.insert(g.symbol(id).unwrap().file.clone());
+            }
+        }
+        assert_eq!(
+            bound,
+            ["py/b.py".to_string(), "top/__init__.py".to_string()]
+                .into_iter()
+                .collect()
         );
     }
 
