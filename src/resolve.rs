@@ -1019,48 +1019,45 @@ fn proven_for_candidate(
         // The full parent chain must anchor at the candidate: a shorter
         // suffix would let `crate::a::b::B` bind any `B` under a `b.rs`
         // anywhere, or `serde::de::Deserialize` capture a namesake in a
-        // local `de.rs`. For a *module* import (`use crate::a::b`) the final
-        // name is itself part of the module path, so `parent + name` is also
-        // an acceptable anchor. (Cost: an import qualified by the crate's
-        // own *name* — `codescope::fresh::LiveGraph` from inside `codescope`
-        // — stays unbound; use `crate::`-style paths.)
+        // local `de.rs`. A *module* candidate must BE the named module path
+        // (`parent + name`, as in `use crate::a::b`) — a module merely
+        // living at the parent scope is the CONTAINER of the named item,
+        // not the item, and must neither capture the import for a
+        // nonexistent symbol nor win the module preference over the real
+        // one. (Cost: an import qualified by the crate's own *name* —
+        // `codescope::fresh::LiveGraph` from inside `codescope` — stays
+        // unbound; use `crate::`-style paths.)
         let mut chain: Vec<&str> = parent.clone();
         chain.push(name);
-        // The extended chain (`parent + name`) is a MODULE path: only a
-        // module candidate may match it — otherwise `use crate::a::B` could
-        // bind a struct `B` in `src/a/B.rs`.
-        let chain_match = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
-        // A caller-relative scope is absolute within the caller's tree: a
-        // same-suffix path in an unrelated workspace crate must not match.
-        if caller_relative {
-            return csegs == parent[..] || (chain_match && csegs == chain[..]);
+        let module_target = c.kind == SymbolKind::Module && csegs.ends_with(&chain);
+        let in_scope = csegs.ends_with(&parent[..]);
+        if c.kind == SymbolKind::Module {
+            if !module_target {
+                return false;
+            }
+            if caller_relative {
+                return csegs == chain[..];
+            }
+            if crate_rooted {
+                let prefix = crate_root_prefix(caller.file);
+                let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
+                return csegs.starts_with(&pref[..]) && csegs.len() == pref.len() + chain.len();
+            }
+            return true;
         }
-        // A crate-rooted path anchors at the CALLER's crate root (the last
-        // `src` directory — workspaces nest crates under crates/foo/src):
-        // the candidate's path must be exactly the root prefix plus the
-        // matched chain.
+        // A symbol target lives in the module at the parent scope.
+        if !in_scope {
+            return false;
+        }
+        if caller_relative {
+            return csegs == parent[..];
+        }
         if crate_rooted {
             let prefix = crate_root_prefix(caller.file);
             let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
-            let anchored = |chain: &[&str]| {
-                csegs.starts_with(&pref)
-                    && csegs.ends_with(chain)
-                    && csegs.len() == pref.len() + chain.len()
-            };
-            return anchored(&parent[..]) || (chain_match && anchored(&chain));
+            return csegs.starts_with(&pref[..]) && csegs.len() == pref.len() + parent.len();
         }
-        if csegs.ends_with(&parent[..]) {
-            return true;
-        }
-        if chain_match {
-            return true;
-        }
-        // A directory scope also matches its crate-root file
-        // (`super::B` from `src/a.rs` scopes to `src/`, whose root module
-        // is `src/lib.rs`).
-        !csegs.is_empty()
-            && matches!(csegs[csegs.len() - 1], "lib" | "main")
-            && csegs[..csegs.len() - 1].ends_with(&parent[..])
+        return true;
     } else {
         // Dotted package paths name the package the class lives in: either
         // the parent chain is the candidate's entire module path (a symbol
@@ -2799,6 +2796,39 @@ mod tests {
         assert!(
             e.to.is_none(),
             "import \"chart.js\" must not bind the in-repo chart.js"
+        );
+    }
+
+    #[test]
+    fn container_mod_rs_does_not_capture_symbol_imports() {
+        // `crate::a::B` with module a as src/a/mod.rs: the struct B inside
+        // it binds — the mod.rs container module does not outrank it, and a
+        // nonexistent B binds nothing at all.
+        let g = graph(&[
+            ("src/x.rs", "use crate::a::B;\nfn main() { let _b: B; }\n"),
+            ("src/a/mod.rs", "pub struct B;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("struct B inside a binds")).unwrap();
+        assert_eq!(target.file, "src/a/mod.rs");
+        assert_eq!(target.kind, SymbolKind::Struct);
+
+        let g2 = graph(&[
+            ("src/x.rs", "use crate::a::Missing;\nfn main() {}\n"),
+            ("src/a/mod.rs", "pub struct Other;\n"),
+        ]);
+        let from2 = module_of(&g2, "src/x.rs");
+        let e2 = g2
+            .out_edges(from2)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e2.to.is_none(),
+            "a nonexistent item must not bind the container module"
         );
     }
 
