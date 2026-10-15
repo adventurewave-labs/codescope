@@ -615,6 +615,11 @@ fn resolve_import(
             }
         }
     }
+    // An import literally named `index`/`__init__`/`mod` reaches those
+    // buckets twice (primary + alt): dedupe so a unique resolution is not
+    // reported as a tie.
+    cand_vec.sort_by_key(|c| c.id);
+    cand_vec.dedup_by_key(|c| c.id);
     let cands = &cand_vec[..];
 
     if relative {
@@ -2745,6 +2750,28 @@ mod tests {
             .find(|e| e.kind == EdgeKind::Imports)
             .unwrap();
         assert!(e.to.is_none(), "use serde; must not bind ./serde.rs");
+    }
+
+    #[test]
+    fn entry_file_named_import_reports_no_false_tie() {
+        // `import index` where index.py is the unique target: the candidate
+        // appears in both the primary and the alt buckets — the binding must
+        // report zero alternatives.
+        let g = graph(&[
+            (
+                "app.py",
+                "import index\n\ndef go():\n    return index.f()\n",
+            ),
+            ("index.py", "def f():\n    return 1\n"),
+        ]);
+        let from = module_of(&g, "app.py");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        let target = g.symbol(e.to.expect("index.py binds")).unwrap();
+        assert_eq!(target.file, "index.py");
+        assert_eq!(e.alternatives, 0, "a unique target is not a tie");
     }
 
     #[test]

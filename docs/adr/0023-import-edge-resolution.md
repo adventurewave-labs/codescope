@@ -54,9 +54,12 @@ Import edges get their own resolution path, separate from call-edge scoring:
      unbound beside a `java/` directory because no candidate sits under a
      `java/util` chain. `crate`/`self`/`super` prove in-repo-ness but are
      dropped before matching, so they do not bypass the module constraint.
-   - **Bare imports bind modules only.** A single-segment import (`import b`,
-     `import time`, `use serde;`) may bind only a module-kind symbol — a
-     same-named function in another file never captures it.
+   - **Bare imports are Python/Ruby and module-only.** A single-segment
+     import may bind only in Python and Ruby (script-dir / `$LOAD_PATH`
+     semantics), only a module-kind symbol, and only anchored at the
+     repository root or the importer's directory. For JS/TS a bare name is
+     node_modules, for Go the standard library, for Rust the extern prelude —
+     none bind (`use serde;` never captures a sibling serde.rs).
 
 Qualified-import candidates prefer module-kind targets (+6 in scoring);
 same-directory candidates get +4. A file never binds an import to itself.
