@@ -733,13 +733,17 @@ fn resolve_import(
                 continue;
             }
         } else {
-            // A bare import names a module — never a function — and its
-            // identity must anchor at the repository root (a top-level
-            // module or package, `import pkg` → pkg/__init__.py) or at the
-            // importer's own directory (a sibling, py/a.py → py/b.py): a
-            // same-named module anywhere else in the tree is not what any
-            // path configuration would resolve to, and binding it would
-            // invent edges (and cycles) that do not exist.
+            // A bare import names a module — never a function. Only Python
+            // and Ruby resolve bare names against the importer's own tree
+            // (script-dir/`$LOAD_PATH` semantics): for them the identity
+            // must anchor at the repository root or the importer's
+            // directory. For every other language a bare name means
+            // something outside the tree — node_modules for JS/TS, the
+            // standard library for Go, the extern prelude for Rust — and
+            // binding a same-named sibling would invent an edge.
+            if !matches!(caller.language, Language::Python | Language::Ruby) {
+                continue;
+            }
             if c.kind != SymbolKind::Module {
                 continue;
             }
@@ -2693,6 +2697,54 @@ mod tests {
             e.to.is_none(),
             "config::Config must not bind the in-repo src/config.rs"
         );
+    }
+
+    #[test]
+    fn bare_imports_are_python_and_ruby_only() {
+        // JS/TS bare imports mean node_modules, Go's mean the standard
+        // library, Rust's the extern prelude: none may bind a same-named
+        // sibling file.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import \"axios\";\nexport function a() { return 1; }\n",
+            ),
+            ("axios.ts", "export function get() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "import \"axios\" must not bind ./axios.ts");
+
+        let g = graph(&[
+            (
+                "a.go",
+                "package a\nimport \"errors\"\nfunc f() { _ = errors.New }\n",
+            ),
+            ("errors.go", "package a\nfunc New() {}\n"),
+        ]);
+        let from = module_of(&g, "a.go");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import \"errors\" must not bind ./errors.go"
+        );
+
+        let g = graph(&[
+            ("src/x.rs", "use serde;\nfn main() { let _s: serde::S; }\n"),
+            ("src/serde.rs", "pub struct S;\n"),
+        ]);
+        let from = module_of(&g, "src/x.rs");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(e.to.is_none(), "use serde; must not bind ./serde.rs");
     }
 
     #[test]
