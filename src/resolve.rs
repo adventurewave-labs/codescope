@@ -1057,7 +1057,7 @@ fn proven_for_candidate(
             let pref: Vec<&str> = prefix.iter().map(|s| s.as_str()).collect();
             return csegs.starts_with(&pref[..]) && csegs.len() == pref.len() + parent.len();
         }
-        return true;
+        true
     } else {
         // Dotted package paths name the package the class lives in: either
         // the parent chain is the candidate's entire module path (a symbol
