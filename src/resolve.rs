@@ -514,6 +514,12 @@ fn resolve_import(
             }
             return None;
         }
+        // A non-relative file-naming import from JS/TS (`import "chart.js"`)
+        // still means node_modules — extension or not, only `./`-relative
+        // imports reach in-repo files (handled by the exact branch above).
+        if matches!(caller.language, Language::JavaScript | Language::TypeScript) {
+            return None;
+        }
         if let Some(cands) = by_basename.get(seg) {
             let mut best: Option<(SymbolId, u32)> = None;
             let mut ties = 0u16;
@@ -2772,6 +2778,28 @@ mod tests {
         let target = g.symbol(e.to.expect("index.py binds")).unwrap();
         assert_eq!(target.file, "index.py");
         assert_eq!(e.alternatives, 0, "a unique target is not a tie");
+    }
+
+    #[test]
+    fn non_relative_js_import_with_extension_stays_unbound() {
+        // `import "chart.js"` (no `./`) is a node_modules reference: a
+        // same-basename in-repo file must not capture it.
+        let g = graph(&[
+            (
+                "a.ts",
+                "import \"chart.js\";\nexport function a() { return 1; }\n",
+            ),
+            ("chart.js", "export function draw() { return 1; }\n"),
+        ]);
+        let from = module_of(&g, "a.ts");
+        let e = g
+            .out_edges(from)
+            .find(|e| e.kind == EdgeKind::Imports)
+            .unwrap();
+        assert!(
+            e.to.is_none(),
+            "import \"chart.js\" must not bind the in-repo chart.js"
+        );
     }
 
     #[test]
