@@ -67,6 +67,12 @@ curl -L https://github.com/adventurewave-labs/codescope/releases/latest/download
 sudo mv codescope-*/codescope /usr/local/bin/
 ```
 
+From crates.io:
+
+```sh
+cargo install codescope-cli
+```
+
 From source:
 
 ```sh
