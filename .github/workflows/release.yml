@@ -35,11 +35,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # workflow_dispatch rebuilds must use the requested tag's source,
+          # not whatever branch the dispatch ran from.
+          ref: ${{ github.event.inputs.tag || github.ref }}
       - run: rustup component add rustfmt clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
       - run: scripts/eval --check
+      - name: Package hygiene — excluded extras must not ship in the .crate
+        run: |
+          bad="$(cargo package --list --allow-dirty | grep -E '^(demo\.gif|assets/|docs/|plans/|scripts/)' || true)"
+          if [[ -n "$bad" ]]; then
+            echo "::error::excluded files leaked into the package:"; echo "$bad"; exit 1
+          fi
+          cargo package --list --allow-dirty | grep -q '^queries/rust.scm$' \
+            || { echo '::error::queries/ missing from package (include_str! inputs)'; exit 1; }
 
   build:
     name: build ${{ matrix.target }}
@@ -51,13 +63,15 @@ jobs:
         include:
           - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl,  archive: tar.gz, run: true }
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, archive: tar.gz, run: true }
-          - { os: macos-14,         target: aarch64-apple-darwin,       archive: tar.gz, run: true }
+          - { os: macos-15,         target: aarch64-apple-darwin,       archive: tar.gz, run: true }
           # Intel macOS runners are being retired: cross-compile on Apple
           # silicon; the smoke step verifies the Mach-O arch instead of running.
-          - { os: macos-14,         target: x86_64-apple-darwin,        archive: tar.gz, run: false }
+          - { os: macos-15,         target: x86_64-apple-darwin,        archive: tar.gz, run: false }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc,     archive: zip,    run: true }
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Toolchain
         shell: bash
@@ -90,8 +104,9 @@ jobs:
         id: pkg
         shell: bash
         run: |
-          ref="${{ github.event.inputs.tag || (github.event_name == 'pull_request' && 'dryrun') || github.ref_name }}"
-          name="codescope-${ref}-${{ matrix.target }}"
+          # Asset names are version-independent so the README's
+          # releases/latest/download/… URL stays evergreen across releases.
+          name="codescope-${{ matrix.target }}"
           mkdir -p "dist/$name"
           if [[ "${{ matrix.os }}" == windows-* ]]; then
             cp target/${{ matrix.target }}/release/codescope.exe "dist/$name/"
@@ -147,3 +162,41 @@ jobs:
             [[ "$tag" == *-* ]] && pre="--prerelease"
             gh release create "$tag" dist/* --title "codescope $tag" --generate-notes $pre
           fi
+
+  publish-crates:
+    name: publish crates.io (codescope-cli)
+    needs: [build, publish]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      # cargo reads CARGO_REGISTRY_TOKEN from the environment; never pass it
+      # via --token (secrets stay out of argv / process listings).
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Skip if no token configured (one-time setup — add repo secret CARGO_REGISTRY_TOKEN)
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: |
+          echo "::warning::CARGO_REGISTRY_TOKEN secret is not set — skipping crates.io publish."
+          echo "Binaries + GitHub Release shipped; run 'cargo publish --locked' manually or add the secret."
+      - name: Guard — tag must match Cargo.toml version; skip if already published
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          ver="$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+          if [[ "v$ver" != "$TAG" ]]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $ver — bump the crate before tagging."
+            exit 1
+          fi
+          # Identifying User-Agent per crates.io data-access policy.
+          if curl -sf -A "codescope-release (github.com/adventurewave-labs/codescope)" \
+              "https://crates.io/api/v1/crates/codescope-cli/$ver" -o /dev/null; then
+            echo "codescope-cli $ver already on crates.io — nothing to do."
+            echo "ALREADY_PUBLISHED=1" >> "$GITHUB_ENV"
+          fi
+      - name: cargo publish
+        if: env.CARGO_REGISTRY_TOKEN != '' && env.ALREADY_PUBLISHED != '1'
+        run: cargo publish --locked

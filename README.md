@@ -1,9 +1,10 @@
-<p align="center"><img src="assets/banner.svg" alt="codescope — animated banner" width="100%"></p>
+<p align="center"><img src="https://raw.githubusercontent.com/adventurewave-labs/codescope/main/assets/banner.svg" alt="codescope — animated banner" width="100%"></p>
 
 # codescope
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20%7C%20Apache--2.0-blue.svg)](#license)
 [![Build](https://github.com/adventurewave-labs/codescope/actions/workflows/ci.yml/badge.svg)](https://github.com/adventurewave-labs/codescope/actions)
+[![crates.io](https://img.shields.io/crates/v/codescope-cli.svg)](https://crates.io/crates/codescope-cli)
 
 > ⭐ If codescope saves you context tokens, [starring the repo](https://github.com/adventurewave-labs/codescope) helps others find it.
 
@@ -11,7 +12,7 @@
 
 ## 🎬 Demo
 
-![codescope indexing itself and answering blast-radius queries](demo.gif)
+![codescope indexing itself and answering blast-radius queries](https://raw.githubusercontent.com/adventurewave-labs/codescope/main/demo.gif)
 
 *codescope v0.1 indexing its own repo — 196 symbols, 1,322 edges in 188 ms — then a summary and a blast-radius query. Recorded from the actual binary with [asciinema](https://asciinema.org) + [agg](https://github.com/asciinema/agg). (The repo has grown since: at HEAD the same self-index is ~620 symbols / 4.5k edges in ~0.7 s.)*
 
@@ -62,8 +63,9 @@ Windows x86_64) are attached to every
 [GitHub Release](https://github.com/adventurewave-labs/codescope/releases):
 
 ```sh
-# example: Linux x86_64
-curl -L https://github.com/adventurewave-labs/codescope/releases/latest/download/codescope-v0.3.0-x86_64-unknown-linux-musl.tar.gz | tar xz
+# example: Linux x86_64 — asset names are version-independent, so this URL
+# is evergreen for `latest`:
+curl -L https://github.com/adventurewave-labs/codescope/releases/latest/download/codescope-x86_64-unknown-linux-musl.tar.gz | tar xz
 sudo mv codescope-*/codescope /usr/local/bin/
 ```
 
