@@ -1,0 +1,15 @@
+# codescope
+
+> Code-intelligence engine for AI coding agents — single Rust binary indexes any repo into a queryable graph over MCP, CLI, and JSON.
+
+codescope is maintained by Adventure Wave Labs (The lab for agentic developer tooling).
+
+## Links
+
+- [Landing page](https://adventurewave-labs.github.io/codescope/): overview, features, FAQ
+- [Source code](https://github.com/adventurewave-labs/codescope): README, issues, releases
+## Install
+
+```
+brew install marcuspat/tap/codescope
+```
