@@ -15,6 +15,11 @@
 (then (identifier) @call)
 (else (identifier) @call)
 (program (identifier) @call)
+; Same for the right operand of a binary expression (`total * tax_rate`): the
+; left operand is usually the accumulator/variable being combined, so only the
+; right side is captured. The extractor drops captures that name a parameter
+; or assigned local of the enclosing def (they are reads, not calls).
+(binary right: (identifier) @call)
 
 ; Imports
 ((call

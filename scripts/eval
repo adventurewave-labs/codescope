@@ -15,6 +15,12 @@ cargo test --release --quiet --test resolution_eval -- --nocapture 2>&1 \
   | sed -n '/^| Language/,/^test /p' | sed '$d' | grep -v '^\.*$'
 
 echo
+echo "== call-resolution accuracy, independent corpus (tests/eval-independent/*, ADR-0024)"
+CODESCOPE_EVAL_REPORT_INDEPENDENT="$PWD/docs/EVAL-INDEPENDENT.md" \
+  cargo test --release --quiet --test resolution_eval_independent -- --nocapture 2>&1 \
+  | sed -n '/^| Language/,/^test /p' | sed '$d' | grep -v '^\.*$'
+
+echo
 echo "== find relevance (codescope's own source)"
 cargo test --release --quiet --test find_relevance -- --nocapture 2>&1 \
   | sed -n '/^find relevance/,/MRR/p'

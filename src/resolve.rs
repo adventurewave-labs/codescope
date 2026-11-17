@@ -356,8 +356,39 @@ fn resolve_one(
     let receiver_is_variable = q.is_some_and(|q| {
         !is_self_qualifier(q) && q.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
     });
+    // An uppercase qualifier naming no in-repo symbol is an external type or
+    // namespace (`Math.round`, `Vec::new`). Whatever shares the callee name in
+    // this repo must not capture the call without module-level evidence.
+    let receiver_is_external_type = q.is_some_and(|q| {
+        q.starts_with(|c: char| c.is_ascii_uppercase())
+            && !is_self_qualifier(q)
+            && !name_index.contains_key(q)
+    });
+    // Sole implementor fallback (ADR-0024). A receiver whose inferred type is
+    // an in-repo type that owns no such method is interface-style dispatch
+    // (`this.gateway.charge()` with `gateway: Gateway` and only `MockGateway`
+    // implementing it). Where a declared interface method exists it binds via
+    // the owner rule above; when it does not (TS/Go/C++ interface members are
+    // not extracted), bind to the single in-repo implementor instead of
+    // dropping the edge. Two or more implementors stay unbound — that is real
+    // dynamic dispatch the heuristics must not guess.
+    if edge.kind == EdgeKind::Calls
+        && best.as_ref().map_or(true, |(_, score)| *score < 16)
+        && q.is_some_and(|q| {
+            q.starts_with(|c: char| c.is_ascii_uppercase())
+                && !is_self_qualifier(q)
+                && candidates.iter().any(|c| c.owner.is_some())
+        })
+    {
+        if let Some(ty) = q {
+            if let Some(id) = sole_implementor(ty, candidates, name_index) {
+                return Some((id, 0));
+            }
+        }
+    }
     match best {
         Some((_, score)) if receiver_is_variable && score < MIN_RECEIVER_SCORE => None,
+        Some((_, score)) if receiver_is_external_type && score < MIN_RECEIVER_SCORE => None,
         // A typed receiver (`Vec`, `String`, an external type) whose type owns
         // none of the candidates: the method lives outside the repo.
         Some((_, score)) if typed_receiver && score < 16 && edge.kind == EdgeKind::Calls => None,
@@ -371,6 +402,52 @@ fn resolve_one(
 /// (Receivers with an inferred type carry that type as the qualifier and
 /// bind via the owner rule instead.)
 const MIN_RECEIVER_SCORE: u32 = 9;
+
+/// The single in-repo implementor of `ty` for the called method, if unambiguous
+/// (ADR-0024). `ty` must itself be a type declared in this repo (`Math`, `Vec`
+/// and other external types never qualify), must own no callable with this
+/// name (an owner match would have bound directly), and exactly one distinct
+/// owner must provide the method — overloads of that owner collapse to the
+/// lowest id, matching the deterministic tie-break.
+fn sole_implementor(
+    ty: &str,
+    candidates: &[Cand],
+    name_index: &HashMap<&str, Vec<Cand>>,
+) -> Option<SymbolId> {
+    // Interface-style dispatch only. A concrete class/struct qualifier that
+    // lacks the method usually means an inherited or external method
+    // (`Foo.toString()`, rust `clone`/`from`) — never a reason to bind an
+    // unrelated same-name owner. C++ abstract classes are classified as
+    // Interface at extraction time (pure-virtual members, ADR-0024).
+    let declared = name_index
+        .get(ty)?
+        .iter()
+        .any(|c| matches!(c.kind, SymbolKind::Interface | SymbolKind::Trait));
+    if !declared {
+        return None;
+    }
+    if candidates
+        .iter()
+        .any(|c| c.kind.is_callable() && c.owner.as_deref() == Some(ty))
+    {
+        return None;
+    }
+    let mut owners: Vec<&str> = candidates
+        .iter()
+        .filter(|c| c.kind.is_callable())
+        .filter_map(|c| c.owner.as_deref())
+        .collect();
+    owners.sort_unstable();
+    owners.dedup();
+    if owners.len() != 1 {
+        return None;
+    }
+    candidates
+        .iter()
+        .filter(|c| c.kind.is_callable() && c.owner.as_deref() == Some(owners[0]))
+        .map(|c| c.id)
+        .min()
+}
 
 /// File extensions an import string may carry when it names a file outright
 /// (`#include "list.h"`, `require "./b.ts"`). Anything else with a dot is a
@@ -2853,5 +2930,253 @@ mod tests {
             .unwrap();
         let target = g.symbol(e.to.expect("app.store.Repo binds")).unwrap();
         assert_eq!(target.file, "tests/eval/java/app/store/Repo.java");
+    }
+
+    #[test]
+    fn interface_typed_receiver_binds_sole_implementor() {
+        // ADR-0024: `gateway` is typed as the interface; only `MockGateway`
+        // implements `charge` in-repo (TS interface members are not extracted,
+        // so the owner rule has nothing to bind). The call must reach the
+        // sole implementor instead of being dropped.
+        let src = "\
+export interface Gateway { charge(c: number): string; }
+export class MockGateway implements Gateway { charge(c: number): string { return \"\"; } }
+export class Checkout {
+    private gateway: Gateway;
+    submit(): string { return this.gateway.charge(1); }
+}
+";
+        let f = extract(Language::TypeScript, "src/a.ts", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        resolve(&mut g);
+        let call = g
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "charge")
+            .expect("charge call extracted");
+        let target = g
+            .symbol(call.to.expect("sole implementor must bind"))
+            .unwrap();
+        assert_eq!(target.owner.as_deref(), Some("MockGateway"));
+    }
+
+    #[test]
+    fn concrete_typed_receiver_never_uses_sole_implementor() {
+        // ADR-0024 guard: a concrete class receiver that lacks the method
+        // usually means an inherited or external method (`Foo.toString()`,
+        // rust `clone`). An unrelated same-name owner must not capture it,
+        // however lonely.
+        let src = "export class Config { label(): string { return \"cfg\"; } }
+export class Other { doThing(): void {} }
+export class App {
+    private cfg: Config;
+    run(): void { this.cfg.doThing(); }
+}
+";
+        let f = extract(Language::TypeScript, "src/a.ts", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        resolve(&mut g);
+        let call = g
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "doThing")
+            .expect("doThing call extracted");
+        assert!(
+            call.to.is_none(),
+            "concrete-class receivers must not bind to an unrelated sole owner"
+        );
+    }
+
+    #[test]
+    fn ruby_param_reads_do_not_create_call_edges() {
+        // `base * rate` where `rate` is a parameter of the enclosing def: the
+        // bare-identifier capture must drop it even though a method named
+        // `rate` exists in the same module.
+        let src = "module Billing
+  def self.total(base, rate)
+    base * rate
+  end
+
+  def self.rate
+    19
+  end
+end
+";
+        let f = extract(Language::Ruby, "lib/billing.rb", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        resolve(&mut g);
+        let to_param = g
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "rate");
+        assert!(
+            to_param.is_none(),
+            "a parameter read must not become a call edge to the same-name method"
+        );
+    }
+
+    #[test]
+    fn ruby_assigned_locals_do_not_create_call_edges() {
+        // `rate = fetch(x)` then `base * rate`: the local read must not bind
+        // to the same-name module method, even though it is the sole owner.
+        let src = "\nmodule Billing\n  def self.total(base)\n    rate = base / 100\n    base * rate\n  end\n\n  def self.rate\n    19\n  end\nend\n";
+        let f = extract(Language::Ruby, "lib/billing.rb", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        resolve(&mut g);
+        assert!(
+            !g.edges()
+                .iter()
+                .any(|e| e.kind == EdgeKind::Calls && e.to_name == "rate"),
+            "assignment-introduced local must not become a call edge to the same-name method"
+        );
+    }
+
+    #[test]
+    fn ruby_comment_tags_do_not_poison_locals_scan() {
+        // A trailing `# eval rate=…` annotation contains `rate=`, which must
+        // not register `rate` as an assigned local: the real call stays.
+        let src = "\nmodule Billing\n  def self.total(base)\n    rate(base) # eval rate=19\n  end\n\n  def self.rate\n    19\n  end\nend\n";
+        let f = extract(Language::Ruby, "lib/billing.rb", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        resolve(&mut g);
+        let call = g
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "rate")
+            .expect("comment tag must not suppress the call capture");
+        let target = g.symbol(call.to.expect("rate call binds")).unwrap();
+        assert_eq!(target.owner.as_deref(), Some("Billing"));
+    }
+
+    #[test]
+    fn ruby_keyword_params_are_locals() {
+        // `def self.total(base, rate: 19)` then `base * rate`: the keyword
+        // parameter is a local read, not a call to the same-name method.
+        let src = "\nmodule Billing\n  def self.total(base, rate: 19)\n    base * rate\n  end\n\n  def self.rate\n    19\n  end\nend\n";
+        let f = extract(Language::Ruby, "lib/billing.rb", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        resolve(&mut g);
+        assert!(
+            !g.edges()
+                .iter()
+                .any(|e| e.kind == EdgeKind::Calls && e.to_name == "rate"),
+            "keyword parameter read must not become a call edge to the same-name method"
+        );
+    }
+
+    #[test]
+    fn ruby_hash_rocket_regex_and_attribute_writes_are_not_locals() {
+        // `=>` in a hash literal, `=~`, `@ivar =`, and `obj.attr =` must not
+        // register locals: a same-name bare call keeps its edge.
+        let src = "\nmodule Billing\n  T = { 'rate' => 1 }\n  def self.match(line)\n    ok = line =~ /rate/\n    @rate = ok\n    obj.attr = 1\n    rate(ok)\n  end\n\n  def self.rate(x)\n    x\n  end\nend\n";
+        let f = extract(Language::Ruby, "lib/billing.rb", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        resolve(&mut g);
+        let call = g
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "rate")
+            .expect("bare rate(…) call must survive hash-rocket, =~, @ivar=, and attr= lines");
+        let target = g.symbol(call.to.expect("rate call binds")).unwrap();
+        assert_eq!(target.owner.as_deref(), Some("Billing"));
+    }
+
+    #[test]
+    fn multiple_implementors_stay_unbound() {
+        // Two implementors of the interface: real dynamic dispatch, no
+        // statically-correct target — the edge must stay unbound.
+        let src = "\
+export interface Gateway { charge(c: number): string; }
+export class A implements Gateway { charge(c: number): string { return \"a\"; } }
+export class B implements Gateway { charge(c: number): string { return \"b\"; } }
+export class Checkout {
+    private gateway: Gateway;
+    submit(): string { return this.gateway.charge(1); }
+}
+";
+        let f = extract(Language::TypeScript, "src/a.ts", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        resolve(&mut g);
+        let call = g
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "charge")
+            .expect("charge call extracted");
+        assert!(call.to.is_none(), "two implementors must not bind");
+    }
+
+    #[test]
+    fn external_typed_receiver_never_uses_sole_implementor() {
+        // `Math.round(...)` — the qualifier names no in-repo type. An unrelated
+        // repo `round` must not capture the call just by being alone.
+        let src_a = "export function round(x: number): number { return x; }\n";
+        let src_b = "export class T { go(x: number): number { return Math.round(x); } }\n";
+        let mut g = CodeGraph::new();
+        g.upsert_file(extract(Language::TypeScript, "src/util.ts", src_a, 0));
+        g.upsert_file(extract(Language::TypeScript, "src/app.ts", src_b, 0));
+        g.reindex();
+        resolve(&mut g);
+        let call = g
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "round")
+            .expect("round call extracted");
+        assert!(
+            call.to.is_none(),
+            "external-typed receivers must stay unbound"
+        );
+    }
+
+    #[test]
+    fn ruby_binary_operand_call_extracts_and_binds() {
+        // `total * tax_rate` — a paren-less call on the right operand of a
+        // binary expression must be extracted and resolve to the module
+        // method (the right side is far more often a call than the left).
+        let src = "\
+module Billing
+  def self.total(base)
+    base * tax_rate
+  end
+
+  def self.tax_rate
+    19
+  end
+end
+";
+        let f = extract(Language::Ruby, "lib/billing.rb", src, 0);
+        let mut g = CodeGraph::new();
+        g.upsert_file(f);
+        g.reindex();
+        let extracted = g
+            .edges()
+            .iter()
+            .any(|e| e.kind == EdgeKind::Calls && e.to_name == "tax_rate");
+        assert!(extracted, "binary-operand call must be extracted");
+        resolve(&mut g);
+        let call = g
+            .edges()
+            .iter()
+            .find(|e| e.kind == EdgeKind::Calls && e.to_name == "tax_rate")
+            .unwrap();
+        let target = g
+            .symbol(call.to.expect("module self-method binds"))
+            .unwrap();
+        assert_eq!(target.owner.as_deref(), Some("Billing"));
     }
 }
