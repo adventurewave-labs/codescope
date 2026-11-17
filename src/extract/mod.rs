@@ -98,6 +98,10 @@ fn kind_for_capture(name: &str) -> Option<SymbolKind> {
 struct DefRecord {
     id: SymbolId,
     kind: SymbolKind,
+    /// Ruby only: parameter names from the AST (the compact signature cuts at
+    /// the first `:`, which eats keyword params). Other languages derive them
+    /// from the signature at use time.
+    params: Vec<String>,
     name: String,
     signature: String,
     span: Span,
@@ -272,6 +276,165 @@ fn go_receiver_type(receiver: &str) -> Option<String> {
     let ty = inner.split_whitespace().last()?;
     let t = bare_type(ty);
     (!t.is_empty()).then_some(t)
+}
+
+/// Parameter names from a one-line signature: `"def self.total(base)"` →
+/// `["base"]`. Defaults (`b = 2`) reduce to the name.
+fn signature_params(signature: &str) -> impl Iterator<Item = &str> {
+    let inner = signature
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(params, _)| params)
+        .unwrap_or("");
+    inner.split(',').map(|p| {
+        p.split('=')
+            .next()
+            .unwrap_or(p)
+            .split(':')
+            .next()
+            .unwrap_or(p) // keyword params: `rate: 19` → `rate`
+            .trim()
+            .trim_start_matches('*')
+            .trim_start_matches('&')
+    })
+}
+
+/// Names assigned inside a body: `rate = fetch(x)`, `count += 1`-style
+/// compound assigns included; `==`, `<=`, `=>` etc. are not assignments.
+/// A hand-rolled scan — the repo has no regex dependency.
+/// Ruby parameter names straight from the method node's parameter list: one
+/// identifier per direct child (`required_parameter`, `optional_parameter`,
+/// `keyword_parameter`, `rest_parameter`). Defaults are not descended into,
+/// so `rate: DEFAULT_RATE` yields only `rate`.
+fn ruby_def_params(node: Node, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let Some(params) = node.child_by_field_name("parameters") else {
+        return names;
+    };
+    let mut cursor = params.walk();
+    for child in params.children(&mut cursor) {
+        if child.kind() == "identifier" {
+            names.push(source[child.start_byte()..child.end_byte()].to_string());
+            continue;
+        }
+        let mut sub = child.walk();
+        let id = child.children(&mut sub).find(|n| n.kind() == "identifier");
+        if let Some(id) = id {
+            names.push(source[id.start_byte()..id.end_byte()].to_string());
+        }
+    }
+    names
+}
+
+/// Drop `# …` line comments so annotation/lint tags (`# eval x=1`) cannot
+/// masquerade as assignments in the locals scan. A `#` preceded by a
+/// non-space character (e.g. inside `"a#b"`) is left alone.
+fn strip_ruby_comments(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let bytes = line.as_bytes();
+        let mut cut = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'#' && (i == 0 || bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+                cut = Some(i);
+                break;
+            }
+        }
+        match cut {
+            Some(i) => out.push_str(&line[..i]),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn assigned_names(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut names = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'=' {
+            continue;
+        }
+        if i + 1 < bytes.len() && matches!(bytes[i + 1], b'=' | b'>' | b'~') {
+            continue; // ==, =>, =~
+        }
+        if i > 0
+            && matches!(
+                bytes[i - 1],
+                b'=' | b'!'
+                    | b'<'
+                    | b'>'
+                    | b'+'
+                    | b'-'
+                    | b'*'
+                    | b'/'
+                    | b'&'
+                    | b'|'
+                    | b'^'
+                    | b'%'
+                    | b'.'
+                    | b':'
+            )
+        {
+            continue; // compound assign, comparison, hash rocket, default param
+        }
+        let mut end = i;
+        while end > 0 && bytes[end - 1] == b' ' {
+            end -= 1;
+        }
+        let mut start = end;
+        while start > 0 && is_ident(bytes[start - 1]) {
+            start -= 1;
+        }
+        if start == end {
+            continue;
+        }
+        if start > 0 && is_ident(bytes[start - 1]) {
+            continue;
+        }
+        // Attribute and global writes (`obj.attr =`, `@ivar =`, `$g =`) name
+        // receivers, not locals — and a bare call sharing the attribute name
+        // must keep its edge.
+        if start > 0 && matches!(bytes[start - 1], b'.' | b'@' | b'$') {
+            continue;
+        }
+        let name = &body[start..end];
+        if name.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') && name != "_" {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Block parameter names: `|e, acc|`, `|&blk|`. Adjacent pipes (`||`) are the
+/// empty parameter list / boolean-or and are skipped.
+fn block_param_names(body: &str) -> Vec<String> {
+    let bytes = body.as_bytes();
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'|'
+            && (i == 0 || bytes[i - 1] != b'|')
+            && (i + 1 >= bytes.len() || bytes[i + 1] != b'|')
+        {
+            if let Some(close) = body[i + 1..].find('|') {
+                let inner = &body[i + 1..i + 1 + close];
+                names.extend(
+                    inner
+                        .split(',')
+                        .map(|p| p.trim().trim_start_matches('&').trim_start_matches('*'))
+                        .filter(|p| !p.is_empty())
+                        .map(String::from),
+                );
+                i += 1 + close;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    names
 }
 
 /// The receiver / path qualifier of a call site, from the callee node's parent:
@@ -587,6 +750,27 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
             if name.is_empty() {
                 continue;
             }
+            // Kind refinements for interface-style dispatch (ADR-0024): the
+            // sole-implementor resolution keys off Interface/Trait kinds.
+            // - C++ has no interface keyword; a class whose members include a
+            //   pure-virtual declaration is an interface. Field initializers
+            //   (`int x = 0;`) do not match — the `= 0` must follow a `)`.
+            // - Go interface declarations land in the generic type_spec
+            //   capture; two competing @def patterns on one node would fight
+            //   over the last-match rule, so the query stays single-purpose.
+            let cpp_abstract = lang == Language::Cpp
+                && kind == SymbolKind::Class
+                && source[dnode.start_byte()..dnode.end_byte()].contains(") = 0");
+            let go_interface = lang == Language::Go
+                && kind == SymbolKind::Type
+                && dnode
+                    .child_by_field_name("type")
+                    .is_some_and(|t| t.kind() == "interface_type");
+            let kind = if cpp_abstract || go_interface {
+                SymbolKind::Interface
+            } else {
+                kind
+            };
             let span = span_of(dnode);
             let owner = if dnode.kind() == "method_declaration" && lang == Language::Go {
                 dnode
@@ -600,10 +784,16 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
                     .and_then(|p| p.child_by_field_name("scope"))
                     .map(|scope| bare_type(&source[scope.start_byte()..scope.end_byte()]))
             };
+            let params = if lang == Language::Ruby {
+                ruby_def_params(dnode, source)
+            } else {
+                Vec::new()
+            };
             defs.push(DefRecord {
                 id: SymbolId(0), // assigned once the final kind is known
                 kind,
                 name,
+                params,
                 signature: signature_of(dnode, source),
                 span,
                 byte_start: dnode.start_byte(),
@@ -770,9 +960,35 @@ pub fn extract(lang: Language, rel_path: &str, source: &str, content_hash: u64) 
 
     // ---- Attribute edge sites to their enclosing definition ----
     let mut type_cache: HashMap<(usize, String), Option<String>> = HashMap::new();
+    let mut local_names_cache: HashMap<usize, Vec<String>> = HashMap::new();
     for mut site in sites {
         let encl = enclosing(&defs, site.node_start, site.node_end, false);
         let from = encl.map(|j| defs[j].id).unwrap_or(module_id);
+        // Ruby bare-identifier captures (statement position, binary right
+        // operand) treat any identifier as a call. A name bound as a local in
+        // the enclosing def — parameter, `x = …` assignment, or block
+        // parameter — is a read, not a call, and a same-name method must not
+        // capture it (ADR-0024).
+        if lang == Language::Ruby && site.qualifier.is_none() && site.kind == EdgeKind::Calls {
+            if let Some(j) = encl {
+                let locals = local_names_cache.entry(j).or_insert_with(|| {
+                    let mut names: Vec<String> = if defs[j].params.is_empty() {
+                        signature_params(&defs[j].signature)
+                            .map(String::from)
+                            .collect()
+                    } else {
+                        defs[j].params.clone()
+                    };
+                    let body = strip_ruby_comments(&source[defs[j].byte_start..defs[j].byte_end]);
+                    names.extend(assigned_names(&body));
+                    names.extend(block_param_names(&body));
+                    names
+                });
+                if locals.iter().any(|n| n == &site.to_name) {
+                    continue;
+                }
+            }
+        }
         // Replace a variable receiver with its inferred type when evident.
         if let (Some(j), Some(q)) = (encl, site.qualifier.clone()) {
             let lower = q.starts_with(|c: char| c.is_ascii_lowercase() || c == '_');
@@ -851,6 +1067,39 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.kind == EdgeKind::Calls && e.to_name == "bar"));
+    }
+
+    #[test]
+    fn classifies_cpp_pure_virtual_class_as_interface() {
+        let src = "class Actuator {\npublic:\n    virtual void engage(int level) = 0;\n    int offset = 0;\n};\nclass Config {\n    int retries = 0;\n};\n";
+        let f = extract(Language::Cpp, "src/a.cpp", src, 0);
+        let by_name = |n: &str| {
+            f.symbols
+                .iter()
+                .find(|s| s.name == n)
+                .map(|s| s.kind)
+                .unwrap()
+        };
+        assert_eq!(by_name("Actuator"), SymbolKind::Interface);
+        // A field initializer (`= 0`) alone must not flip the kind.
+        assert_eq!(by_name("Config"), SymbolKind::Class);
+    }
+
+    #[test]
+    fn classifies_go_interface_declaration_as_interface() {
+        let src = "package ship\n\ntype Manifester interface {\n\tRegister(p Parcel) int\n}\n\ntype Parcel struct {\n\tSKU string\n}\n";
+        let f = extract(Language::Go, "pkg/ship/ship.go", src, 0);
+        let by_name = |n: &str| {
+            f.symbols
+                .iter()
+                .find(|s| s.name == n)
+                .map(|s| s.kind)
+                .unwrap()
+        };
+        assert_eq!(by_name("Manifester"), SymbolKind::Interface);
+        // The generic type_spec capture keeps structs as Type; only the
+        // interface refinement promotes a kind.
+        assert_eq!(by_name("Parcel"), SymbolKind::Type);
     }
 
     #[test]

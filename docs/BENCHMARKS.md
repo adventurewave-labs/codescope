@@ -139,3 +139,32 @@ CLI `find` end-to-end: 115 ms (gson, 4.5k symbols), 690 ms (dotnet/samples, 25k 
 
 Before the ADR-0022 fixes (class instantiation, field-receiver inference, `dyn Trait`): 1.00 / 0.78.
 Per-language table and the remaining misses: [`EVAL.md`](EVAL.md).
+
+## Independent reproduction (ADR-0024)
+
+The numbers above are measured against the project's own annotations. An
+independent corpus — 11 fixtures, 77 annotated sites across 10 languages plus
+one polyglot graph, authored and sha256-frozen outside this repo, scored
+through the installed CLI binary only — reproduced on codescope 0.3.0
+(**P 0.97 / R 0.88**): precision held, recall did not. The gap was one
+coherent class the in-repo corpus never exercises: interface-typed receivers
+(`gateway: Gateway`, Go interface values, `Actuator*`) produced **no edge at
+all**, because TS/Go/C++ interface members are not extracted and the
+typed-receiver rule abstained. Ruby paren-less calls inside binary
+expressions (`total * tax_rate`) were not extracted at all. A guard probe
+also showed `Math.round(x)` capturing an unrelated in-repo `round`.
+
+ADR-0024 fixes all three (sole-implementor fallback; binary right-operand
+capture; external-type evidence floor) and ships the corpus as
+`tests/eval-independent/` gated in CI. Post-fix, on the same frozen corpus:
+**P 0.98 / R 1.00 / F1 0.99**. The one remaining FP is a documented
+convention site (Java binds interface-typed receivers to the declaration,
+matching this repo's `Shape::area` convention, while the corpus annotates the
+sole implementation). The original corpus is unchanged: still P 1.00 / R 0.97,
+including its two pre-existing receiver misses (`a.st.Put`,
+`Store::open().put()`), now visible in `docs/EVAL.md`'s miss list.
+
+Reproduce: `scripts/eval` (runs both corpora), or `cargo test --release
+--test resolution_eval_independent`. Corpus provenance and the full
+claim-by-claim comparison: the rig workspace's
+`codescope-eval/EVALUATION-INDEPENDENT-2026-11-17.md`.
